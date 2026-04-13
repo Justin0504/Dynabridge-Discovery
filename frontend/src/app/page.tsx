@@ -21,6 +21,8 @@ import {
   Layers,
   PanelLeftClose,
   PanelLeftOpen,
+  Trash2,
+  RefreshCw,
 } from "lucide-react";
 import { t, type Locale } from "@/lib/i18n";
 import {
@@ -33,6 +35,7 @@ import {
   addComment,
   getComments,
   downloadUrl,
+  deleteProject,
   type Project,
   type SlidePreview,
   type Comment,
@@ -184,6 +187,12 @@ export default function Home() {
     setCompletedSteps(new Set());
     setCurrentStep(null);
     setIsGenerating(false);
+  };
+
+  const handleDeleteProject = async (pid: number) => {
+    await deleteProject(pid);
+    if (activeProjectId === pid) handleNewProject();
+    loadProjects();
   };
 
   const handleAddCompetitor = () => {
@@ -389,6 +398,13 @@ export default function Home() {
                         <div className="flex items-start justify-between gap-2">
                           <span className={`text-sm font-medium truncate ${isActive ? "text-brand-600" : "text-neutral-800"}`}>
                             {p.name}
+                          </span>
+                          <span
+                            role="button"
+                            onClick={(e) => { e.stopPropagation(); handleDeleteProject(p.id); }}
+                            className="text-neutral-300 hover:text-red-500 shrink-0 p-0.5"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
                           </span>
                         </div>
 
@@ -688,7 +704,7 @@ export default function Home() {
               )}
             </button>
 
-            {/* Download Buttons */}
+            {/* Download + Regenerate */}
             {projectId && slides.length > 0 && (
               <div className="flex gap-2">
                 <a
@@ -698,6 +714,13 @@ export default function Home() {
                   <Download className="w-4 h-4" />
                   {t("download.pptx", locale)}
                 </a>
+                <button
+                  onClick={handleGenerate}
+                  disabled={isGenerating}
+                  className="py-2.5 px-4 flex items-center justify-center gap-2 border border-neutral-300 text-neutral-600 font-medium rounded-xl hover:bg-neutral-50 disabled:opacity-50 transition-all text-sm"
+                >
+                  <RefreshCw className="w-4 h-4" />
+                </button>
               </div>
             )}
           </div>

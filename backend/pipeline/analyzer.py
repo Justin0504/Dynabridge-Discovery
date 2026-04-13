@@ -52,7 +52,59 @@ COUNT YOUR CHARACTERS. Any text exceeding these limits will be truncated and loo
 - Evidence-based: cite specific data points, prices, phrases from the provided content
 - Strategically honest: surface real weaknesses alongside strengths
 - Implication-driven: every observation should point to a "so what"
-- No filler: if you don't have data for a section, say what's missing and what you can infer
+- IMPORTANT: When data is limited, use your industry expertise to INFER and HYPOTHESIZE.
+  Never write "no data available" or "cannot assess". Instead, write what you CAN infer
+  from whatever signals exist (brand name, URL, category, competitors), and flag it as
+  inference. A strategist always has a point of view — even with incomplete data.
+
+## FEW-SHOT EXAMPLES — match this quality, density, and tone exactly:
+
+EXAMPLE SLIDE 1 (Capabilities):
+{
+  "title": "HOW COZYFIT WAS BUILT: EXECUTION FIRST",
+  "bullets": [
+    "CozyFit prioritized product quality and pricing over brand building.",
+    "Amazon-first launch with product iteration — a founder-led approach.",
+    "Built sales velocity and reviews, but deferred brand definition."
+  ],
+  "insight": "Execution-driven success — but execution alone won't sustain growth."
+}
+
+EXAMPLE SLIDE 2 (Capabilities):
+{
+  "title": "A FUNCTIONAL, FEATURE-LED, VALUE-FOCUSED OFFER",
+  "bullets": [
+    "Messaging emphasizes comfort, fit, and affordability over brand story.",
+    "Product pages communicate stretch, pockets, and fabric performance.",
+    "Easy to compare but follows category norms — no clear differentiation."
+  ],
+  "insight": "CozyFit presents as a practical solution, not a differentiated brand."
+}
+
+EXAMPLE SLIDE 3 (Competition):
+{
+  "title": "PRICE-PERFORMANCE DEFINES THE CURRENT POSITION",
+  "bullets": [
+    "Positioned below FIGS ($38-48) while offering similar functional benefits.",
+    "Messaging reinforces value and practicality over exclusivity or status.",
+    "Supports trial and volume but limits premium brand perception."
+  ],
+  "insight": "Market role is defined by value, not by brand-led positioning."
+}
+
+EXAMPLE SLIDE 4 (Consumer):
+{
+  "title": "HEALTHCARE WORKERS PRIORITIZE EVIDENCE OVER CLAIMS",
+  "bullets": [
+    "Professionals apply evidence-based thinking to scrubs purchases.",
+    "Comfort and durability claims must be backed by fabric technology.",
+    "Price sensitivity varies by career stage and income level."
+  ],
+  "insight": "They buy scrubs like they practice medicine — with evidence."
+}
+
+Notice: each bullet is ONE short sentence under 80 chars. Each insight is sharp and opinionated.
+Your output must match this caliber. Generic or vague analysis is unacceptable.
 
 You must output ONLY valid JSON. No markdown, no commentary before or after."""
 

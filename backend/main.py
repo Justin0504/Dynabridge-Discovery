@@ -68,6 +68,48 @@ def get_project(project_id: int):
         return _project_dict(project, include_slides=True, include_comments=True)
 
 
+@app.patch("/api/projects/{project_id}")
+def update_project(
+    project_id: int,
+    name: str = Form(None),
+    brand_url: str = Form(None),
+    competitor_urls: str = Form(None),
+    language: str = Form(None),
+    phase: str = Form(None),
+):
+    with Session() as db:
+        project = db.query(Project).get(project_id)
+        if not project:
+            raise HTTPException(404, "Project not found")
+        if name is not None:
+            project.name = name
+        if brand_url is not None:
+            project.brand_url = brand_url
+        if competitor_urls is not None:
+            project.competitor_urls = competitor_urls
+        if language is not None:
+            project.language = language
+        if phase is not None:
+            project.phase = phase
+        db.commit()
+        db.refresh(project)
+        return _project_dict(project)
+
+
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: int):
+    with Session() as db:
+        project = db.query(Project).get(project_id)
+        if not project:
+            raise HTTPException(404, "Project not found")
+        db.query(Comment).filter_by(project_id=project_id).delete()
+        db.query(Slide).filter_by(project_id=project_id).delete()
+        db.query(UploadedFile).filter_by(project_id=project_id).delete()
+        db.delete(project)
+        db.commit()
+        return {"deleted": True}
+
+
 # ─── File Upload ──────────────────────────────────────────────
 
 @app.post("/api/projects/{project_id}/files")
@@ -195,23 +237,29 @@ async def generate_report(project_id: int, phase: str = Form("full")):
             project.status = ProjectStatus.ANALYZING
             db.commit()
 
-            from pipeline.analyzer import analyze_brand
-            competitors = json.loads(project.competitor_urls) if project.competitor_urls else []
-            analysis = await analyze_brand(
-                brand_name=project.name,
-                brand_url=project.brand_url,
-                scrape_data=scrape_result,
-                document_data=parsed_docs,
-                competitors=competitors,
-                language=project.language,
-                phase=phase,
-                ecommerce_data=ecommerce_data,
-                review_data=review_data,
-                competitor_data=competitor_data,
-            )
-            project.analysis_json = json.dumps(analysis, ensure_ascii=False)
-            db.commit()
-            yield _sse("progress", {"step": "analyzing", "message": "Analysis complete", "done": True})
+            try:
+                from pipeline.analyzer import analyze_brand
+                competitors = json.loads(project.competitor_urls) if project.competitor_urls else []
+                analysis = await analyze_brand(
+                    brand_name=project.name,
+                    brand_url=project.brand_url,
+                    scrape_data=scrape_result,
+                    document_data=parsed_docs,
+                    competitors=competitors,
+                    language=project.language,
+                    phase=phase,
+                    ecommerce_data=ecommerce_data,
+                    review_data=review_data,
+                    competitor_data=competitor_data,
+                )
+                project.analysis_json = json.dumps(analysis, ensure_ascii=False)
+                db.commit()
+                yield _sse("progress", {"step": "analyzing", "message": "Analysis complete", "done": True})
+            except Exception as e:
+                project.status = ProjectStatus.DRAFT
+                db.commit()
+                yield _sse("error", {"message": f"AI analysis failed: {str(e)}"})
+                return
 
             # Step 3b: Collect images for PPT
             collected_images = None
@@ -235,36 +283,41 @@ async def generate_report(project_id: int, phase: str = Form("full")):
             project.status = ProjectStatus.GENERATING
             db.commit()
 
-            from pipeline.ppt_generator import generate_pptx
-            pptx_path, slide_previews = await generate_pptx(
-                project_id=project_id,
-                analysis=analysis,
-                brand_name=project.name,
-                phase=phase,
-                collected_images=collected_images,
-            )
-            project.pptx_path = str(pptx_path)
-            project.status = ProjectStatus.REVIEW
-            db.commit()
-
-            # Delete old slide records before saving new ones
-            db.query(Slide).filter_by(project_id=project_id).delete()
-            db.commit()
-
-            # Save slide records
-            for i, preview in enumerate(slide_previews):
-                slide = Slide(
+            try:
+                from pipeline.ppt_generator import generate_pptx
+                pptx_path, slide_previews = await generate_pptx(
                     project_id=project_id,
-                    order=i,
-                    slide_type=preview.get("type", "unknown"),
-                    content_json=json.dumps(preview.get("content", {}), ensure_ascii=False),
-                    preview_path=preview.get("preview_path", ""),
+                    analysis=analysis,
+                    brand_name=project.name,
+                    phase=phase,
+                    collected_images=collected_images,
                 )
-                db.add(slide)
-            db.commit()
+                project.pptx_path = str(pptx_path)
+                project.status = ProjectStatus.REVIEW
+                db.commit()
 
-            yield _sse("progress", {"step": "generating", "message": "PowerPoint generated", "done": True})
-            yield _sse("complete", {"pptx_path": str(pptx_path), "slide_count": len(slide_previews)})
+                # Delete old slide records before saving new ones
+                db.query(Slide).filter_by(project_id=project_id).delete()
+                db.commit()
+
+                # Save slide records
+                for i, preview in enumerate(slide_previews):
+                    slide = Slide(
+                        project_id=project_id,
+                        order=i,
+                        slide_type=preview.get("type", "unknown"),
+                        content_json=json.dumps(preview.get("content", {}), ensure_ascii=False),
+                        preview_path=preview.get("preview_path", ""),
+                    )
+                    db.add(slide)
+                db.commit()
+
+                yield _sse("progress", {"step": "generating", "message": "PowerPoint generated", "done": True})
+                yield _sse("complete", {"pptx_path": str(pptx_path), "slide_count": len(slide_previews)})
+            except Exception as e:
+                project.status = ProjectStatus.DRAFT
+                db.commit()
+                yield _sse("error", {"message": f"PPT generation failed: {str(e)}"})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

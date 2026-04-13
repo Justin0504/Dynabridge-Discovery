@@ -29,6 +29,8 @@ async def parse_documents(file_paths: list[str]) -> list[dict]:
                 text = _parse_docx(path)
             elif suffix == ".txt":
                 text = path.read_text(encoding="utf-8", errors="ignore")
+            elif suffix == ".pptx":
+                text = _parse_pptx(path)
             else:
                 text = f"[Unsupported file type: {suffix}]"
         except Exception as e:
@@ -76,3 +78,23 @@ def _parse_docx(path: Path) -> str:
         return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
     except ImportError:
         return "[Install python-docx to parse DOCX files]"
+
+
+def _parse_pptx(path: Path) -> str:
+    """Extract text from PPTX slides."""
+    try:
+        from pptx import Presentation
+        prs = Presentation(str(path))
+        parts = []
+        for i, slide in enumerate(prs.slides):
+            texts = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    t = shape.text_frame.text.strip()
+                    if t:
+                        texts.append(t)
+            if texts:
+                parts.append(f"[Slide {i+1}]\n" + "\n".join(texts))
+        return "\n\n".join(parts)
+    except ImportError:
+        return "[Install python-pptx to parse PPTX files]"

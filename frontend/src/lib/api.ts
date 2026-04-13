@@ -156,3 +156,19 @@ export async function getComments(projectId: number): Promise<Comment[]> {
 export function downloadUrl(projectId: number): string {
   return `${API_BASE}/api/projects/${projectId}/download`;
 }
+
+export async function deleteProject(projectId: number): Promise<void> {
+  await fetch(`${API_BASE}/api/projects/${projectId}`, { method: "DELETE" });
+}
+
+export async function updateProject(
+  projectId: number,
+  data: Partial<{ name: string; brand_url: string; competitor_urls: string; language: string; phase: string }>
+): Promise<Project> {
+  const form = new FormData();
+  for (const [key, value] of Object.entries(data)) {
+    if (value !== undefined) form.append(key, value);
+  }
+  const res = await fetch(`${API_BASE}/api/projects/${projectId}`, { method: "PATCH", body: form });
+  return res.json();
+}
