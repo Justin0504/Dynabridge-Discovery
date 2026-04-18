@@ -232,6 +232,91 @@ async def generate_report(project_id: int, phase: str = Form("full")):
             except Exception:
                 yield _sse("progress", {"step": "competitors", "message": "Competitor discovery skipped", "done": True})
 
+            # Step 2e: Desktop research pipeline (3 sequential sessions)
+            desktop_research = None
+            industry_data = None
+            try:
+                # Session 1: Brand + Category Research
+                yield _sse("progress", {"step": "researching", "message": "Researching brand background and category..."})
+                from pipeline.managed_agent import research_brand_context
+                brand_context = await research_brand_context(
+                    brand_name=project.name,
+                    brand_url=project.brand_url,
+                )
+                yield _sse("progress", {"step": "researching", "message": "Brand research complete. Cooling down before next session..."})
+                await asyncio.sleep(30)
+
+                # Re-discover competitors using brand context if initial discovery was poor
+                comp_names = json.loads(project.competitor_urls) if project.competitor_urls else []
+
+                def _is_bad_competitor_name(n):
+                    n_lower = n.lower()
+                    if len(n) > 40 or n.startswith("(") or n.startswith("$"):
+                        return True
+                    if any(kw in n_lower for kw in ["amazon", "buying", "reviewed", "past month", "/count", "stainless", "recycled", "contains"]):
+                        return True
+                    if "$" in n or n_lower in ("other", "none", "n/a"):
+                        return True
+                    return False
+
+                bad_names = [n for n in comp_names if _is_bad_competitor_name(n)]
+                if len(bad_names) >= len(comp_names) / 2 or not comp_names:
+                    yield _sse("progress", {"step": "researching", "message": "Re-discovering competitors with category context..."})
+                    cat_name = ""
+                    if brand_context and brand_context.get("category_landscape"):
+                        cat_name = brand_context["category_landscape"].get("category_name", "")
+                    from pipeline.managed_agent import discover_competitors_managed
+                    rediscovered = await discover_competitors_managed(
+                        brand_name=project.name,
+                        brand_url=project.brand_url,
+                        category_context=cat_name,
+                        max_competitors=8,
+                    )
+                    if rediscovered and len(rediscovered) >= 3:
+                        comp_names = [c["name"] for c in rediscovered]
+                        project.competitor_urls = json.dumps(comp_names, ensure_ascii=False)
+                        db.commit()
+                        yield _sse("progress", {"step": "researching", "message": f"Re-discovered {len(comp_names)} competitors"})
+                        await asyncio.sleep(30)
+
+                # Session 2: Competitor Deep Profiles
+                competitor_profiles = []
+                if comp_names:
+                    yield _sse("progress", {"step": "researching", "message": f"Deep-researching {len(comp_names)} competitors..."})
+                    from pipeline.managed_agent import research_competitor_profiles
+                    competitor_profiles = await research_competitor_profiles(
+                        brand_name=project.name,
+                        competitors=comp_names,
+                        category="",
+                        brand_context=brand_context,
+                    )
+                    yield _sse("progress", {"step": "researching", "message": f"Competitor profiles complete ({len(competitor_profiles)} profiled). Cooling down..."})
+                    await asyncio.sleep(30)
+
+                # Session 3: Consumer + Market Research
+                yield _sse("progress", {"step": "researching", "message": "Researching consumer behavior and market dynamics..."})
+                from pipeline.managed_agent import research_consumer_landscape
+                consumer_landscape = await research_consumer_landscape(
+                    brand_name=project.name,
+                    category="",
+                    brand_context=brand_context,
+                    competitor_profiles=competitor_profiles,
+                )
+                yield _sse("progress", {"step": "researching", "message": "Consumer research complete"})
+
+                desktop_research = {
+                    "brand_context": brand_context,
+                    "competitor_profiles": competitor_profiles,
+                    "consumer_landscape": consumer_landscape,
+                }
+
+                # Extract industry data from brand_context for backward compatibility
+                if brand_context and brand_context.get("category_landscape"):
+                    industry_data = brand_context["category_landscape"]
+
+            except Exception as e:
+                yield _sse("progress", {"step": "researching", "message": f"Desktop research partially complete: {str(e)[:100]}"})
+
             # Step 3: AI Analysis
             yield _sse("progress", {"step": "analyzing", "message": "Running AI brand analysis..."})
             project.status = ProjectStatus.ANALYZING
@@ -251,27 +336,38 @@ async def generate_report(project_id: int, phase: str = Form("full")):
                     ecommerce_data=ecommerce_data,
                     review_data=review_data,
                     competitor_data=competitor_data,
+                    desktop_research=desktop_research,
                 )
+                if industry_data:
+                    analysis["industry_trends"] = industry_data
                 project.analysis_json = json.dumps(analysis, ensure_ascii=False)
                 db.commit()
                 yield _sse("progress", {"step": "analyzing", "message": "Analysis complete", "done": True})
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 project.status = ProjectStatus.DRAFT
                 db.commit()
                 yield _sse("error", {"message": f"AI analysis failed: {str(e)}"})
                 return
 
-            # Step 3b: Collect images for PPT
+            # Step 3b: Collect images for PPT (with category-aware keywords)
             collected_images = None
             try:
                 yield _sse("progress", {"step": "images", "message": "Collecting brand images..."})
-                from pipeline.image_collector import collect_images
+                from pipeline.image_collector import collect_images, infer_category_keywords
+                cat_keywords = infer_category_keywords(
+                    brand_name=project.name,
+                    category="",
+                    brand_context=desktop_research.get("brand_context") if desktop_research else None,
+                )
                 collected_images = await collect_images(
                     project_id=project_id,
                     brand_name=project.name,
                     brand_url=project.brand_url,
                     scrape_data=scrape_result,
                     ecommerce_data=ecommerce_data,
+                    category_keywords=cat_keywords,
                 )
                 img_count = len(collected_images.get("all", []))
                 yield _sse("progress", {"step": "images", "message": f"Collected {img_count} images", "done": True})
@@ -381,6 +477,40 @@ def resolve_comment(comment_id: int):
         comment.resolved = 1
         db.commit()
         return {"resolved": True}
+
+
+# ─── Survey Design ──────────────────────────────────────────
+
+@app.post("/api/projects/{project_id}/survey")
+async def design_survey_endpoint(project_id: int):
+    """Generate a customized survey questionnaire for a project."""
+    with Session() as db:
+        project = db.query(Project).get(project_id)
+        if not project:
+            raise HTTPException(404, "Project not found")
+
+        from pipeline.survey_designer import design_survey
+        competitors = json.loads(project.competitor_urls) if project.competitor_urls else []
+
+        context = ""
+        if project.analysis_json:
+            try:
+                analysis = json.loads(project.analysis_json)
+                cap = analysis.get("capabilities", {})
+                comp = analysis.get("competition", {})
+                context = f"Capabilities summary: {cap.get('capabilities_summary', '')}\n"
+                context += f"Competition summary: {comp.get('competition_summary', '')}"
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        survey = await design_survey(
+            brand_name=project.name,
+            brand_url=project.brand_url,
+            competitors=competitors,
+            language=project.language,
+            analysis_context=context,
+        )
+        return survey
 
 
 # ─── Download ─────────────────────────────────────────────────

@@ -41,7 +41,10 @@ async def discover_competitors(
         )
         if managed_results and len(managed_results) >= 3:
             return managed_results
-    except Exception:
+        else:
+            print(f"[competitor_discovery] Managed agent returned {len(managed_results) if managed_results else 0} results, falling through")
+    except Exception as e:
+        print(f"[competitor_discovery] Managed agent failed: {e}")
         pass  # Fall through to legacy methods
 
     # Strategy 2: Legacy — Amazon scraping + AI inference in parallel
@@ -136,9 +139,28 @@ async def _discover_from_amazon(
 
             # Clean and count brand mentions
             brand_name_lower = brand_name.lower()
+            junk_patterns = {
+                "sponsored", "list:", "typical:", "save ", "climate pledge",
+                "bought in past", "featured offers", "no featured",
+                "amazon's choice", "best seller", "limited time",
+                "deal of the day", "pack of", "count (pack",
+                "subscribe", "free delivery", "prime", "coupon",
+                "editorial", "results", "price:", "stars",
+                "premium brands", "top brands", "top rated",
+                "our brands", "related brands", "popular brands",
+                "more results", "see more", "shop now",
+                "customers also", "frequently bought",
+                "from the manufacturer", "highly rated",
+                "new arrivals", "new releases",
+                "left in stock", "order soon", "only ",
+                "add to cart", "add to list", "save for later",
+                "in stock", "out of stock", "ships from",
+                "fulfilled by", "sold by",
+            }
             brand_counts = Counter()
             for b in brands:
                 clean = b.strip()
+                lower = clean.lower()
                 if (
                     clean
                     and len(clean) > 1
@@ -146,6 +168,9 @@ async def _discover_from_amazon(
                     and clean.lower() != brand_name_lower
                     and not clean.startswith("Visit")
                     and not clean.isdigit()
+                    and not any(j in lower for j in junk_patterns)
+                    and not lower.endswith("$")
+                    and not lower[0].isdigit()
                 ):
                     brand_counts[clean] += 1
 

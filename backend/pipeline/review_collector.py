@@ -86,11 +86,14 @@ async def collect_reviews(brand_name: str, urls: list[str] = None, max_reviews: 
         dist = Counter(int(r) for r in ratings)
         result["summary"]["rating_distribution"] = {str(k): dist.get(k, 0) for k in range(1, 6)}
 
-    # Sentiment analysis
-    result["sentiment"] = _analyze_sentiment(all_reviews)
-
-    # Theme extraction
-    result["themes"] = _extract_themes(all_reviews)
+    # AI-powered sentiment analysis (falls back to keyword-based)
+    ai_result = _analyze_sentiment_ai(all_reviews)
+    if ai_result:
+        result["sentiment"] = ai_result.get("sentiment", {})
+        result["themes"] = ai_result.get("themes", {"positive": [], "negative": []})
+    else:
+        result["sentiment"] = _analyze_sentiment(all_reviews)
+        result["themes"] = _extract_themes(all_reviews)
 
     return result
 
@@ -344,3 +347,59 @@ def _extract_themes(reviews: list[dict]) -> dict:
         "positive": _to_list(positive_themes),
         "negative": _to_list(negative_themes),
     }
+
+
+# ── AI-Powered Sentiment Analysis ───────────────────────────
+
+def _analyze_sentiment_ai(reviews: list[dict]) -> dict | None:
+    """Use Claude Haiku for NLP-level sentiment + theme analysis."""
+    try:
+        from anthropic import Anthropic
+        from config import ANTHROPIC_API_KEY
+    except ImportError:
+        return None
+
+    if not ANTHROPIC_API_KEY:
+        return None
+
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    review_texts = []
+    for r in reviews[:50]:
+        rating = r.get("rating", 0)
+        text = r.get("text", "")[:300]
+        title = r.get("title", "")
+        review_texts.append(f"[{rating}★] {title}: {text}")
+
+    if not review_texts:
+        return None
+
+    prompt = f"""Analyze these {len(review_texts)} customer product reviews. Return ONLY a JSON object with:
+
+1. "sentiment": {{"positive_pct": number, "negative_pct": number, "neutral_pct": number}} (must sum to 100)
+2. "themes": {{
+     "positive": [{{"theme": "name", "count": estimated_count, "examples": ["quote1", "quote2"]}}],
+     "negative": [{{"theme": "name", "count": estimated_count, "examples": ["quote1", "quote2"]}}]
+   }}
+
+Identify 4-8 themes per category. Use short theme names (e.g., "comfort", "fit", "durability").
+Examples should be direct quotes from the reviews (1 sentence each).
+
+Reviews:
+{chr(10).join(review_texts)}"""
+
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            return json.loads(text[start:end])
+    except Exception:
+        pass
+
+    return None

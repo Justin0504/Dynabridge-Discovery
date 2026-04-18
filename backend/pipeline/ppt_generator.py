@@ -28,6 +28,7 @@ import sys
 from pathlib import Path
 from pptx import Presentation
 from pptx.util import Pt, Emu
+from pptx.dml.color import RGBColor
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import OUTPUT_DIR, PREVIEW_DIR
@@ -59,6 +60,29 @@ T_CONSUMER_SUMMARY = 79     # Consumer summary (half-text, half-image)
 T_FINAL_SUMMARY = 80        # Three-column summary + closing insight
 T_THANK_YOU = 91
 
+# Chart slide templates (questionnaire/survey section, slides 27-46)
+T_CHART_DIVIDER_DEMO = 27      # "Demographics & Background" divider
+T_CHART_SINGLE_HBAR = 34       # Single full-width hbar (e.g., Work Apparel)
+T_CHART_DUAL = 35              # Donut left + hbar right (e.g., Purchase Frequency)
+T_CHART_SINGLE_VBAR = 30       # Single full-width vbar (e.g., Occupation)
+T_CHART_STACKED = 42           # Stacked bar (e.g., Brand Awareness)
+T_CHART_DIVIDER_SHOPPING = 33  # "Shopping Habits" divider
+T_CHART_DIVIDER_BRAND = 40     # "Brand Evaluation" divider
+T_CHART_TABLE = 39             # Challenges table (text-only slide)
+
+# Boilerplate slides
+T_SEGMENTATION_INTRO = 48      # "Benefits of segmentation" boilerplate
+T_FOCUSING_SEGMENTS = 50       # "FOCUSING ON THE MOST DOMINANT SEGMENTS…"
+T_SEGMENT_PROFILE = 52         # Segment respondent profile (demographics layout)
+T_CLOSER_LOOK_1 = 53           # "A Closer Look" — premium callout + small icon
+T_CLOSER_LOOK_2 = 54           # "A Closer Look" — brand awareness + verbatim quotes
+T_CLOSER_LOOK_3 = 56           # "A Closer Look" — 4 lifestyle signal cards
+T_CHALLENGES = 55              # Challenges & Pain Points (two tables)
+T_SELECTING_TARGET = 75        # "SELECTING [BRAND]'S TARGET AUDIENCE"
+T_BRAND_METRICS_DEF = 45       # "Brand Metrics Definitions" boilerplate (GOATClean)
+
+ASSETS_DIR = Path(__file__).parent.parent / "templates" / "assets"
+
 
 # ── Slide Cloning Engine ─────────────────────────────────────
 
@@ -76,8 +100,10 @@ def _get_source():
 def _clone_slide(dst_prs, src_slide_idx):
     """Clone a slide from the reference PPTX into dst_prs.
 
-    Copies all shapes (text boxes, images, groups) and their
-    relationships (embedded images). Returns the new slide object.
+    Copies all shapes (text boxes, images, groups) and only the
+    relationships actually referenced by those shapes. This avoids
+    duplicating notesSlide/themeOverride/tags parts that cause ZIP
+    corruption.
     """
     src_prs = _get_source()
     src_slide = src_prs.slides[src_slide_idx]
@@ -99,34 +125,113 @@ def _clone_slide(dst_prs, src_slide_idx):
         sp = ph._element
         sp.getparent().remove(sp)
 
-    # Copy image/chart relationships, building old→new rId map
-    rId_map = {}
-    for rel in src_slide.part.rels.values():
-        if "image" in rel.reltype or "chart" in rel.reltype:
-            new_rId = new_slide.part.rels._add_relationship(
-                rel.reltype, rel._target, rel.is_external
-            )
-            rId_map[rel.rId] = new_rId
-
-    # Copy all shape elements, remapping relationship IDs
     ns_r = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+    # Step 1: Deep-copy shape elements and collect all rIds they reference
+    copied_elements = []
+    referenced_rIds = set()
     for shape in src_slide.shapes:
         el = copy.deepcopy(shape._element)
-        # Remap rIds in all attributes
+        copied_elements.append(el)
         for attr_el in el.iter():
+            for attr_name in list(attr_el.attrib):
+                if attr_name == f"{ns_r}id" or attr_name.endswith("}id"):
+                    referenced_rIds.add(attr_el.attrib[attr_name])
+            if "embed" in attr_el.attrib:
+                referenced_rIds.add(attr_el.attrib["embed"])
+            if f"{ns_r}embed" in attr_el.attrib:
+                referenced_rIds.add(attr_el.attrib[f"{ns_r}embed"])
+
+    # Step 2: Copy relationships — for image/hdphoto parts, create a proper
+    # copy in the destination package so partnames don't collide with
+    # future add_picture calls (which use next_image_partname).
+    SKIP_RELTYPES = {"chart", "tags", "tag", "notesSlide", "themeOverride"}
+    IMAGE_RELTYPES = {"image", "hdphoto"}
+    rId_map = {}
+    for rel in src_slide.part.rels.values():
+        if rel.rId not in referenced_rIds:
+            continue
+        reltype_short = rel.reltype.split("/")[-1]
+        if reltype_short in SKIP_RELTYPES:
+            continue
+        try:
+            if reltype_short in IMAGE_RELTYPES and not rel.is_external:
+                # Copy image blob into the destination package to avoid
+                # cross-package Part references that cause partname collisions
+                import io
+                src_part = rel._target
+                if reltype_short == "image":
+                    img_part, new_rId = new_slide.part.get_or_add_image_part(
+                        io.BytesIO(src_part.blob)
+                    )
+                else:
+                    # hdphoto — just reference the source directly
+                    # (hdphotos don't collide with image indices)
+                    new_rId = new_slide.part.rels._add_relationship(
+                        rel.reltype, rel._target, rel.is_external
+                    )
+            else:
+                new_rId = new_slide.part.rels._add_relationship(
+                    rel.reltype, rel._target, rel.is_external
+                )
+            rId_map[rel.rId] = new_rId
+        except Exception:
+            pass
+
+    # Step 3: Remap rIds and remove elements with dangling references
+    ns_p = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+    ns_a = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+
+    skip_shapes = []
+    for el in copied_elements:
+        dangling_elements = []
+        for attr_el in el.iter():
+            has_dangling = False
             for attr_name in list(attr_el.attrib):
                 if attr_name == f"{ns_r}id" or attr_name.endswith("}id"):
                     old_id = attr_el.attrib[attr_name]
                     if old_id in rId_map:
                         attr_el.attrib[attr_name] = rId_map[old_id]
+                    elif old_id in referenced_rIds:
+                        has_dangling = True
             if "embed" in attr_el.attrib:
                 old_id = attr_el.attrib["embed"]
                 if old_id in rId_map:
                     attr_el.attrib["embed"] = rId_map[old_id]
+                elif old_id in referenced_rIds:
+                    has_dangling = True
             if f"{ns_r}embed" in attr_el.attrib:
                 old_id = attr_el.attrib[f"{ns_r}embed"]
                 if old_id in rId_map:
                     attr_el.attrib[f"{ns_r}embed"] = rId_map[old_id]
+                elif old_id in referenced_rIds:
+                    has_dangling = True
+            if has_dangling:
+                dangling_elements.append(attr_el)
+
+        # Remove elements with dangling rIds (chart embeds, tag refs, etc.)
+        for dang in dangling_elements:
+            parent = dang.getparent()
+            if parent is not None:
+                parent.remove(dang)
+
+        # Drop the whole top-level shape if it is a graphicFrame whose
+        # graphicData no longer has any chart/table/etc. content
+        el_tag = el.tag.split("}")[-1]
+        if el_tag == "graphicFrame":
+            graphic_data = el.find(f".//{ns_a}graphicData")
+            if graphic_data is not None and len(graphic_data) == 0:
+                skip_shapes.append(el)
+                continue
+
+        # Clean up empty custDataLst / extLst containers left behind
+        for empty_container_tag in (f"{ns_p}custDataLst", f"{ns_p}extLst", f"{ns_a}extLst"):
+            for container in el.findall(f".//{empty_container_tag}"):
+                if len(container) == 0:
+                    parent = container.getparent()
+                    if parent is not None:
+                        parent.remove(container)
+
         new_slide.shapes._spTree.append(el)
 
     return new_slide
@@ -188,10 +293,49 @@ def _set_text_preserve_format(text_frame, new_text):
                     p_el.getparent().remove(p_el)
 
 
+def _has_cjk(text: str) -> bool:
+    """Check if text contains CJK characters."""
+    return any('\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf' for c in text)
+
+
+CJK_FONT = "Heiti SC"
+
+
+def _fix_cjk_fonts(prs):
+    """Scan all slides and set CJK-compatible font on any run containing CJK text."""
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if not shape.has_text_frame:
+                continue
+            for para in shape.text_frame.paragraphs:
+                for run in para.runs:
+                    if _has_cjk(run.text):
+                        _set_cjk_font(run)
+
+
+def _set_cjk_font(run):
+    """Set East Asian font on a run so CJK characters render correctly."""
+    from lxml import etree
+    nsmap = {
+        'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+    }
+    rPr = run._r.find('{http://schemas.openxmlformats.org/drawingml/2006/main}rPr')
+    if rPr is None:
+        rPr = etree.SubElement(
+            run._r, '{http://schemas.openxmlformats.org/drawingml/2006/main}rPr')
+        run._r.insert(0, rPr)
+    ea = rPr.find('{http://schemas.openxmlformats.org/drawingml/2006/main}ea')
+    if ea is None:
+        ea = etree.SubElement(
+            rPr, '{http://schemas.openxmlformats.org/drawingml/2006/main}ea')
+    ea.set('typeface', CJK_FONT)
+
+
 def _replace_para_text(paragraph, text):
     """Replace text in a paragraph, distributing across existing runs.
 
     Preserves each run's formatting (font, size, color, bold).
+    Sets CJK-compatible font when text contains Chinese characters.
     """
     runs = paragraph.runs
     if not runs:
@@ -200,10 +344,12 @@ def _replace_para_text(paragraph, text):
 
     if len(runs) == 1:
         runs[0].text = text
+        if _has_cjk(text):
+            _set_cjk_font(runs[0])
     else:
-        # Multiple runs with potentially different formatting.
-        # Keep each run, clear all but the first, put text in first.
         runs[0].text = text
+        if _has_cjk(text):
+            _set_cjk_font(runs[0])
         for run in runs[1:]:
             run.text = ""
 
@@ -252,13 +398,16 @@ def _truncate(text, max_chars):
 
 # ── Image Replacement ───────────────────────────────────────
 
-def _replace_slide_image(slide, image_path: Path):
-    """Replace the first picture shape on a slide with a new image.
+def _replace_slide_image(slide, image_path: Path, replace_background=False):
+    """Replace a picture shape on a slide with a new image.
+
+    By default replaces the first non-background picture. With
+    replace_background=True, replaces the largest (background) picture
+    instead — used for "Meet the Segment" hero slides.
 
     Pre-crops the image file with PIL to exactly match the box aspect
     ratio (cover + top-bias), then inserts the cropped image at the
-    exact box dimensions. No OOXML stretching or srcRect needed —
-    the file itself is the right shape.
+    exact box dimensions.
     """
     if not image_path or not Path(image_path).exists():
         return
@@ -266,48 +415,145 @@ def _replace_slide_image(slide, image_path: Path):
     from PIL import Image
     from pptx.shapes.picture import Picture
 
+    SLIDE_AREA = 12192000 * 6858000  # 16:9 widescreen
+
+    # Collect all picture shapes first to avoid mutation-during-iteration
+    pictures = []
     for shape in slide.shapes:
         if isinstance(shape, Picture):
-            box_left, box_top = shape.left, shape.top
             box_w, box_h = shape.width, shape.height
-            box_ratio = box_w / box_h
+            is_bg = (box_w * box_h) / SLIDE_AREA > 0.9
+            if replace_background and not is_bg:
+                continue
+            if not replace_background and is_bg:
+                continue
+            pictures.append(shape)
 
-            try:
-                img = Image.open(str(image_path))
-                img_w, img_h = img.size
-            except Exception:
-                return
+    if not pictures:
+        return
 
-            img_ratio = img_w / img_h
+    shape = pictures[0]
+    box_left, box_top = shape.left, shape.top
+    box_w, box_h = shape.width, shape.height
+    if box_h == 0:
+        return
+    box_ratio = box_w / box_h
 
-            # Crop image to match box aspect ratio (cover mode)
-            if abs(img_ratio - box_ratio) > 0.05:
-                if img_ratio > box_ratio:
-                    # Image is wider — crop sides equally
-                    new_w = int(img_h * box_ratio)
-                    offset = (img_w - new_w) // 2
-                    img = img.crop((offset, 0, offset + new_w, img_h))
-                else:
-                    # Image is taller — crop with top bias (keep ~top 1/3)
-                    new_h = int(img_w / box_ratio)
-                    # Bias toward top: show top 30% anchor point
-                    top_offset = int((img_h - new_h) * 0.15)
-                    img = img.crop((0, top_offset, img_w, top_offset + new_h))
+    try:
+        img = Image.open(str(image_path))
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGBA")
+        else:
+            img = img.convert("RGB")
+        img_w, img_h = img.size
+    except Exception:
+        return
 
-            # Save cropped version to a temp file
-            cropped_path = image_path.parent / f"_cropped_{image_path.name}"
-            img.save(str(cropped_path), quality=92)
-            img.close()
+    img_ratio = img_w / img_h
 
-            # Remove old picture
-            sp = shape._element
-            sp.getparent().remove(sp)
+    # Crop image to match box aspect ratio (cover mode)
+    if abs(img_ratio - box_ratio) > 0.05:
+        if img_ratio > box_ratio:
+            new_w = int(img_h * box_ratio)
+            offset = (img_w - new_w) // 2
+            img = img.crop((offset, 0, offset + new_w, img_h))
+        else:
+            new_h = int(img_w / box_ratio)
+            top_offset = int((img_h - new_h) * 0.15)
+            img = img.crop((0, top_offset, img_w, top_offset + new_h))
 
-            # Insert pre-cropped image at exact box dimensions
-            slide.shapes.add_picture(
-                str(cropped_path), box_left, box_top, box_w, box_h
-            )
-            return
+    cropped_path = image_path.parent / f"_cropped_{image_path.stem}.png"
+    img.save(str(cropped_path), format="PNG")
+    img.close()
+
+    # Get a properly-registered ImagePart for the cropped image
+    image_part, rId = slide.part.get_or_add_image_part(str(cropped_path))
+
+    # Update the existing Picture's blip to reference the new image,
+    # rather than remove+add which risks partname collisions with
+    # source Parts from _clone_slide that share the same package
+    ns_r = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    ns_a_uri = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    blip = shape._element.find(f".//{{{ns_a_uri}}}blip")
+    if blip is not None:
+        blip.set(f"{ns_r}embed", rId)
+        # Remove artistic effect layers that reference old image parts
+        for child in list(blip):
+            tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+            if tag == "imgLayer":
+                blip.remove(child)
+        return
+
+    # Fallback: remove and recreate
+    sp = shape._element
+    sp.getparent().remove(sp)
+    slide.shapes.add_picture(str(cropped_path), box_left, box_top, box_w, box_h)
+    return
+
+
+def _replace_card_images(slide, img_pool):
+    """Replace multiple card-sized images on a slide (e.g., Closer Look 3).
+
+    Finds all Picture shapes between 5% and 20% of slide area (the 4 lifestyle
+    cards) and replaces each with a different brand image.
+    """
+    from PIL import Image
+    from pptx.shapes.picture import Picture
+
+    SLIDE_AREA = 12192000 * 6858000
+
+    cards = []
+    for shape in slide.shapes:
+        if isinstance(shape, Picture):
+            area_pct = (shape.width * shape.height) / SLIDE_AREA
+            if 0.05 < area_pct < 0.20:
+                cards.append(shape)
+
+    for shape in cards:
+        image_path = img_pool.next_brand()
+        if not image_path or not Path(image_path).exists():
+            continue
+
+        box_w, box_h = shape.width, shape.height
+        if box_h == 0:
+            continue
+        box_ratio = box_w / box_h
+
+        try:
+            img = Image.open(str(image_path))
+            if img.mode in ("RGBA", "P", "LA"):
+                img = img.convert("RGBA")
+            else:
+                img = img.convert("RGB")
+            img_w, img_h = img.size
+        except Exception:
+            continue
+
+        img_ratio = img_w / img_h
+        if abs(img_ratio - box_ratio) > 0.05:
+            if img_ratio > box_ratio:
+                new_w = int(img_h * box_ratio)
+                offset = (img_w - new_w) // 2
+                img = img.crop((offset, 0, offset + new_w, img_h))
+            else:
+                new_h = int(img_w / box_ratio)
+                top_offset = int((img_h - new_h) * 0.15)
+                img = img.crop((0, top_offset, img_w, top_offset + new_h))
+
+        cropped_path = image_path.parent / f"_cropped_{image_path.stem}.png"
+        img.save(str(cropped_path), format="PNG")
+        img.close()
+
+        image_part, rId = slide.part.get_or_add_image_part(str(cropped_path))
+        ns_r = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+        ns_a_uri = "http://schemas.openxmlformats.org/drawingml/2006/main"
+        blip = shape._element.find(f".//{{{ns_a_uri}}}blip")
+        if blip is not None:
+            blip.set(f"{ns_r}embed", rId)
+            for child in list(blip):
+                tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                if tag == "imgLayer":
+                    blip.remove(child)
 
 
 class _ImagePool:
@@ -485,7 +731,12 @@ def _build_landscape_slide(prs, title, bullets, sidebar_text):
             bullets = [_truncate(bullets, 100)]
         _set_text_preserve_format(shapes[1].text_frame, bullets)
     if len(shapes) >= 3:
-        _set_text_preserve_format(shapes[2].text_frame, _truncate(sidebar_text, 300))
+        _set_text_preserve_format(shapes[2].text_frame, _truncate(sidebar_text, 180))
+        # Reduce font size for sidebar callout to prevent overflow
+        for para in shapes[2].text_frame.paragraphs:
+            for run in para.runs:
+                if run.font.size and run.font.size > Pt(16):
+                    run.font.size = Pt(14)
 
     return slide
 
@@ -607,12 +858,539 @@ def _build_meet_segment(prs, segment):
     # Find the shapes by content length pattern
     for s in shapes:
         text = s.text_frame.text.strip()
+        if not text:
+            continue
         if text.isupper() and len(text) < 30:
             _set_text_preserve_format(s.text_frame, name.upper())
         elif len(text) < 80 and not text.isupper() and "Meet" not in text:
             _set_text_preserve_format(s.text_frame, _truncate(tagline, 70))
         elif len(text) > 80 or "Meet" in text:
             _set_text_preserve_format(s.text_frame, _truncate(narrative, 500))
+
+    return slide
+
+
+def _build_segment_closer_look(prs, segment, slide_num=1):
+    """Build 'A Closer Look' slide using the real template layouts.
+
+    Slide_num determines template and data:
+      1: T_CLOSER_LOOK_1 (slide 53) — premium/driver callout text
+      2: T_CLOSER_LOOK_2 (slide 54) — brand awareness + verbatim quotes
+      3: T_CLOSER_LOOK_3 (slide 56) — 4 lifestyle signal cards
+    """
+    name = segment.get("name", "SEGMENT")
+    mini = segment.get("mini_tables", {})
+    lifestyle = segment.get("lifestyle_signals", [])
+    title = f"{name.upper()} – A CLOSER LOOK"
+
+    if slide_num == 1:
+        slide = _clone_slide(prs, T_CLOSER_LOOK_1)
+        shapes = _find_text_shapes(slide)
+        drivers = mini.get("purchase_drivers", [])
+        motivations = segment.get("key_motivations", [])
+        unmet = segment.get("unmet_needs", "")
+        description = segment.get("description", "")
+        wtp = segment.get("willingness_to_pay", "")
+        strategic = segment.get("strategic_value", "")
+
+        # Build callout from whatever data is available
+        callout = ""
+        if drivers:
+            top = " and ".join(f"{d['item'].lower()} ({d['pct']}%)" for d in drivers[:2])
+            callout = f"Top purchase drivers are {top}. {drivers[0]['item']} ({drivers[0]['pct']}%) leads all drivers."
+        elif motivations:
+            items = ", ".join(str(m).lower() for m in motivations[:3])
+            callout = f"Key motivations: {items}."
+            if unmet:
+                callout += f" Unmet need: {unmet}"
+        elif description:
+            callout = description
+
+        stat = ""
+        pain = mini.get("pain_points", [])
+        if pain:
+            stat = f"{pain[0]['item'].lower()} ({pain[0]['pct']}%) is the top pain point"
+        elif wtp:
+            stat = f"Willingness to pay: {wtp}"
+        elif strategic:
+            stat = strategic[:80]
+
+        # Assign text by shape role: title gets segment name, the two largest
+        # remaining text areas get callout and stat, everything else is cleared
+        # to prevent overlap from the many small template text boxes.
+        title_done = False
+        candidates = []
+        for s in shapes:
+            text = s.text_frame.text.strip()
+            if not title_done and ("CLOSER LOOK" in text.upper() or "ENDURANCE" in text.upper()
+                                   or "PROFILE" in text.upper()):
+                _set_text_preserve_format(s.text_frame, _truncate(title, 55))
+                title_done = True
+            elif "base" in text.lower():
+                continue  # leave sample-size footer as-is
+            elif text:
+                area = s.width * s.height
+                candidates.append((area, s))
+
+        # Sort by area descending — largest gets callout, second gets stat
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        for i, (area, s) in enumerate(candidates):
+            if i == 0 and callout:
+                # Estimate max chars from box width (roughly 10 chars per inch at 16pt)
+                max_chars = max(40, int(s.width / 914400 * 10))
+                _set_text_preserve_format(s.text_frame, _truncate(callout, max_chars))
+            elif i == 1 and stat:
+                max_chars = max(20, int(s.width / 914400 * 10))
+                _set_text_preserve_format(s.text_frame, _truncate(stat, max_chars))
+            else:
+                # Clear remaining small boxes to prevent clutter/overlap
+                for p in s.text_frame.paragraphs:
+                    for r in p.runs:
+                        r.text = ""
+        return slide
+
+    elif slide_num == 2:
+        slide = _clone_slide(prs, T_CLOSER_LOOK_2)
+        shapes = _find_text_shapes(slide)
+        shop = segment.get("shopping_behavior", {})
+        needs = segment.get("top_needs", [])
+        pain_points = segment.get("pain_points", [])
+
+        # Insert a visual in the area where the template's chart used to be
+        # (graphicFrame was stripped during clone). Prefer real percentage data
+        # from mini_tables; fall back to ranked key_motivations/unmet_needs.
+        categories, values = [], []
+        for src_key in ("purchase_drivers", "pain_points", "pre_purchase"):
+            data = mini.get(src_key) or []
+            if isinstance(data, list) and data and isinstance(data[0], dict) and "pct" in data[0]:
+                for item in data[:5]:
+                    label = str(item.get("item", ""))[:24]
+                    pct = item.get("pct", 0)
+                    if label and pct:
+                        categories.append(label)
+                        values.append(float(pct))
+                break
+
+        if not categories:
+            motivations = segment.get("key_motivations") or []
+            if isinstance(motivations, list) and motivations:
+                ranked = [(str(m)[:24], 100 - i * 20) for i, m in enumerate(motivations[:5])]
+                categories = [r[0] for r in ranked]
+                values = [r[1] for r in ranked]
+
+        if categories and values:
+            from pipeline.chart_renderer import render_hbar
+            import tempfile
+            tmp_chart = Path(tempfile.mkstemp(suffix="_closer_bar.png")[1])
+            # Narrower than original graphicFrame (5.27M EMU) so it doesn't
+            # collide with the quote bubble at x=4583380
+            render_hbar(categories, values, output_path=tmp_chart, size=(850, 1000))
+            slide.shapes.add_picture(
+                str(tmp_chart),
+                Emu(426582), Emu(1606658),
+                width=Emu(4056798), height=Emu(4795527),
+            )
+
+        # Build richer fallback text from segment-level data
+        channels = segment.get("channels", [])
+        touchpoints = segment.get("media_touchpoints", [])
+        wtp = segment.get("willingness_to_pay", "")
+        description = segment.get("description", "")
+        unmet = segment.get("unmet_needs", "")
+
+        channel_detail = ""
+        if channels:
+            channel_detail = f"Channels: {', '.join(channels[:3])}"
+        if touchpoints:
+            channel_detail += f" | Media: {', '.join(touchpoints[:3])}"
+        if wtp:
+            channel_detail += f" | WTP: {wtp}"
+
+        # Map text shapes by position and content
+        for s in shapes:
+            text = s.text_frame.text.strip()
+            if "CLOSER LOOK" in text.upper() or "ENDURANCE" in text.upper():
+                _set_text_preserve_format(s.text_frame, _truncate(title, 55))
+            elif "Brand Awareness" in text:
+                label = "Key Motivations" if segment.get("key_motivations") else "Shopping Behavior"
+                _set_text_preserve_format(s.text_frame, label)
+            elif "Top 3" in text or "important features" in text.lower():
+                if needs:
+                    label = f"Top needs: {', '.join(needs[:3])}"
+                elif channels:
+                    label = f"Key channels: {', '.join(channels[:3])}"
+                else:
+                    label = description[:80] if description else name
+                _set_text_preserve_format(s.text_frame, _truncate(label, 80))
+            elif "comfort" in text.lower() or "All-day" in text:
+                pre = mini.get("pre_purchase", [])
+                detail = " | ".join(f"{p['item']} ({p['pct']}%)" for p in pre[:3]) if pre else ""
+                if shop:
+                    detail = f"Channel: {shop.get('primary_channel', 'N/A')} | Spend: {shop.get('annual_spend', 'N/A')} | {detail}"
+                if not detail:
+                    detail = channel_detail or description[:150]
+                _set_text_preserve_format(s.text_frame, _truncate(detail, 150))
+            elif "anything else" in text.lower() or "experience" in text.lower():
+                prompt = unmet[:80] if unmet else "What challenges or pain points do they face?"
+                _set_text_preserve_format(s.text_frame, _truncate(prompt, 80))
+            elif text.startswith('"') or "stress" in text.lower() or "wish" in text.lower():
+                # Verbatim quote bubbles — fill with pain points or motivations/needs
+                quotes = list(pain_points) if pain_points else []
+                if not quotes:
+                    for m in segment.get("key_motivations", []):
+                        quotes.append(f"I need {str(m).lower()}")
+                    if unmet:
+                        for sentence in unmet.split(". "):
+                            if sentence.strip():
+                                quotes.append(sentence.strip())
+                idx = 0
+                for s2 in shapes:
+                    t2 = s2.text_frame.text.strip()
+                    if t2.startswith('"') or (len(t2) > 20 and s2.top > 3000000):
+                        if idx < len(quotes):
+                            _set_text_preserve_format(s2.text_frame, _truncate(f'"{quotes[idx]}"', 100))
+                        else:
+                            _set_text_preserve_format(s2.text_frame, "")
+                        idx += 1
+                break
+        return slide
+
+    else:
+        slide = _clone_slide(prs, T_CLOSER_LOOK_3)
+        shapes = _find_text_shapes(slide)
+        # Slide 56 layout: title + 4 lifestyle text boxes at bottom
+
+        # If no lifestyle_signals, synthesize from channels/motivations/touchpoints
+        if not lifestyle or all(not l.get("detail") for l in lifestyle):
+            lifestyle = []
+            channels = segment.get("channels", [])
+            touchpoints = segment.get("media_touchpoints", [])
+            motivations = segment.get("key_motivations", [])
+            for ch in channels[:2]:
+                lifestyle.append({"category": "Channel", "detail": str(ch)})
+            for tp in touchpoints[:1]:
+                lifestyle.append({"category": "Media", "detail": str(tp)})
+            for m in motivations[:1]:
+                lifestyle.append({"category": "Motivation", "detail": str(m)})
+
+        while len(lifestyle) < 4:
+            lifestyle.append({"category": "", "detail": ""})
+
+        for s in shapes:
+            text = s.text_frame.text.strip()
+            if "CLOSER LOOK" in text.upper() or "ENDURANCE" in text.upper():
+                _set_text_preserve_format(s.text_frame, _truncate(title, 55))
+
+        # Find the 4 bottom text boxes (top > 4500000, sorted by left)
+        bottom_shapes = sorted(
+            [s for s in shapes if s.top > 4500000 and s.text_frame.text.strip() and "base" not in s.text_frame.text.lower()],
+            key=lambda s: s.left,
+        )
+        for idx, s in enumerate(bottom_shapes[:4]):
+            if idx < len(lifestyle) and lifestyle[idx].get("detail"):
+                _set_text_preserve_format(s.text_frame, _truncate(lifestyle[idx]["detail"], 90))
+            else:
+                _set_text_preserve_format(s.text_frame, "")
+
+        return slide
+
+
+def _build_segment_profile(prs, segment):
+    """Clone the respondent profile slide for a segment.
+
+    Template idx 52 has 2 chart graphicFrames (stripped during clone),
+    demographic icons, and label text boxes.  We replace the stripped
+    charts with a rendered demographics bar, and update the labels
+    with whatever structured data we can extract.
+    """
+    slide = _clone_slide(prs, T_SEGMENT_PROFILE)
+    name = segment.get("name", "SEGMENT")
+    demo_raw = segment.get("demographics", "")
+    size_pct = segment.get("size_pct", "")
+    channels = segment.get("channels", [])
+    wtp = segment.get("willingness_to_pay", "")
+
+    shapes = _find_text_shapes(slide)
+    for s in shapes:
+        text = s.text_frame.text.strip()
+        if "RESPONDENT PROFILE" in text.upper() or "ENDURANCE" in text.upper():
+            _set_text_preserve_format(s.text_frame, f"{name.upper()} – RESPONDENT PROFILE")
+        elif "base" in text.lower() and "n" in text.lower():
+            _set_text_preserve_format(s.text_frame, f"Segment size: {size_pct}% of audience" if size_pct else "")
+
+    # Parse simple tokens from demographics string
+    demo_lower = demo_raw.lower() if demo_raw else ""
+    demo_items = {
+        "Generation": "",
+        "Marital Status": "",
+        "Household Income": "",
+        "Race / Ethnicity": "",
+    }
+    import re as _re
+    age_match = _re.search(r'(\d{1,2}[\s–\-]+\d{1,2})', demo_raw)
+    if age_match:
+        demo_items["Generation"] = f"Age {age_match.group(1)}"
+    income_match = _re.search(r'(\$[\d,]+[kK]?\s*[\-–]\s*\$[\d,]+[kK]?)', demo_raw)
+    if income_match:
+        demo_items["Household Income"] = income_match.group(1)
+    for kw in ("female", "male", "women", "men"):
+        if kw in demo_lower:
+            demo_items["Race / Ethnicity"] = kw.capitalize()
+            break
+
+    # Update matching label shapes
+    for s in shapes:
+        text = s.text_frame.text.strip()
+        for label, value in demo_items.items():
+            if text == label:
+                continue  # keep the header labels as-is
+        # Replace percentage placeholders with parsed values or dashes
+        if _re.match(r'^\d{1,3}%$', text):
+            _set_text_preserve_format(s.text_frame, "—")
+        elif text in ("Married or domestic partnership", "Single, never married",
+                       "Widowed, divorced or separated"):
+            pass  # keep as template labels
+        elif text.startswith("Low") or text.startswith("High") or text.startswith("Upper"):
+            pass  # keep income bracket labels
+
+    # Insert a demographics summary bar chart where charts were stripped
+    categories = []
+    values = []
+    if channels:
+        for i, ch in enumerate(channels[:5]):
+            categories.append(str(ch)[:20])
+            values.append(100 - i * 15)
+    if categories and values:
+        from pipeline.chart_renderer import render_hbar
+        import tempfile
+        tmp_chart = Path(tempfile.mkstemp(suffix="_profile_bar.png")[1])
+        render_hbar(categories, values, output_path=tmp_chart,
+                    question="Top Channels", size=(1330, 1000))
+        slide.shapes.add_picture(
+            str(tmp_chart),
+            Emu(393229), Emu(1483388),
+            width=Emu(3551494), height=Emu(2674705),
+        )
+
+    return slide
+
+
+def _build_segment_challenges(prs, segment):
+    """Clone the challenges & pain points slide for a segment.
+
+    Template idx 55 has two tables:
+      - Shape 1: 16×1 verbatim quote table
+      - Shape 3: 8×2 pain-point + percentage table
+    We fill them from unmet_needs, key_motivations, and description.
+    """
+    slide = _clone_slide(prs, T_CHALLENGES)
+    name = segment.get("name", "SEGMENT")
+    unmet = segment.get("unmet_needs", "")
+    motivations = segment.get("key_motivations", [])
+    description = segment.get("description", "")
+
+    shapes = _find_text_shapes(slide)
+    for s in shapes:
+        text = s.text_frame.text.strip()
+        if "CHALLENGES" in text.upper() or "ENDURANCE" in text.upper():
+            _set_text_preserve_format(s.text_frame, f"{name.upper()} – KEY NEEDS & CHALLENGES")
+        elif text == "Pain Points":
+            _set_text_preserve_format(s.text_frame, "Top Needs")
+
+    # Build quote lines from unmet_needs
+    quote_lines = []
+    if unmet:
+        for sentence in unmet.replace(". ", ".\n").split("\n"):
+            sentence = sentence.strip()
+            if sentence:
+                quote_lines.append(f'"{sentence}"')
+    while len(quote_lines) < 4 and motivations:
+        m = motivations.pop(0)
+        quote_lines.append(f'"{m}"')
+
+    # Build needs rows from key_motivations + parsed unmet_needs
+    need_rows = []
+    for m in segment.get("key_motivations", []):
+        need_rows.append((str(m)[:50], ""))
+    if not need_rows and unmet:
+        for part in unmet.split(","):
+            part = part.strip()
+            if part:
+                need_rows.append((part[:50], ""))
+
+    # Fill tables
+    for sh in slide.shapes:
+        if hasattr(sh, "has_table") and sh.has_table:
+            t = sh.table
+            cols = len(t.columns)
+            rows = len(t.rows)
+            if cols == 1 and rows > 4:
+                # Verbatim quotes table
+                for ri in range(rows):
+                    cell = t.cell(ri, 0)
+                    if ri == 0:
+                        cell.text = "What are the unmet needs of this segment?"
+                    elif ri - 1 < len(quote_lines):
+                        cell.text = quote_lines[ri - 1]
+                    else:
+                        cell.text = ""
+            elif cols == 2:
+                # Pain points / needs table
+                for ri in range(rows):
+                    if ri < len(need_rows):
+                        t.cell(ri, 0).text = need_rows[ri][0]
+                        t.cell(ri, 1).text = need_rows[ri][1]
+                    else:
+                        t.cell(ri, 0).text = ""
+                        t.cell(ri, 1).text = ""
+
+    return slide
+
+
+def _build_brand_metrics_def(prs):
+    """Clone brand metrics definitions boilerplate slide."""
+    slide = _clone_slide(prs, T_CHART_TABLE)
+    shapes = _find_text_shapes(slide)
+
+    if len(shapes) >= 1:
+        _set_text_preserve_format(shapes[0].text_frame, "BRAND METRICS DEFINITIONS")
+
+    definitions = (
+        "Aided Awareness: % of consumers who recognize your brand when prompted.\n"
+        "Purchase: % of consumers who have bought your brand's products within a specific timeframe.\n"
+        "Satisfaction: % of purchasers who report being satisfied with the product.\n"
+        "Recommendation: % of purchasers likely to recommend the brand to others."
+    )
+
+    _remove_chart_shapes(slide, clean_region=True)
+    from pptx.util import Pt
+    txBox = slide.shapes.add_textbox(
+        Emu(419100), Emu(1400000), Emu(11353800), Emu(4000000)
+    )
+    tf = txBox.text_frame
+    tf.word_wrap = True
+    for line in definitions.split("\n"):
+        p = tf.paragraphs[0] if not tf.paragraphs[0].text else tf.add_paragraph()
+        run = p.add_run()
+        run.text = line
+        run.font.size = Pt(16)
+        run.font.color.rgb = RGBColor(0x29, 0x25, 0x24)
+
+    return slide
+
+
+def _build_segmentation_intro(prs):
+    """Clone segmentation benefits boilerplate slide."""
+    slide = _clone_slide(prs, T_SEGMENTATION_INTRO)
+    return slide
+
+
+def _build_focusing_segments(prs, segments):
+    """Clone 'FOCUSING ON THE MOST DOMINANT SEGMENTS…' slide (slide 50).
+
+    Shows segments with percentages and taglines, highlighting the dominant ones.
+    Template has: title + 5 percentage auto-shapes + 5 name text boxes + 5 taglines.
+    """
+    slide = _clone_slide(prs, T_FOCUSING_SEGMENTS)
+    shapes = _find_text_shapes(slide)
+
+    # Categorize shapes by position
+    pct_shapes = []   # auto shapes with percentages (top ~1735234)
+    name_shapes = []  # text boxes with names (top ~4242581)
+    tag_shapes = []   # text boxes with taglines (top ~4661986+)
+    title_shape = None
+
+    for s in slide.shapes:
+        if not s.has_text_frame:
+            continue
+        text = s.text_frame.text.strip()
+        if "FOCUSING" in text.upper() or "DOMINANT" in text.upper():
+            title_shape = s
+        elif text.endswith("%") and len(text) <= 4:
+            pct_shapes.append(s)
+        elif s.top > 4600000:
+            tag_shapes.append(s)
+        elif s.top > 4000000 and len(text) < 30:
+            name_shapes.append(s)
+
+    # Sort by left position
+    pct_shapes.sort(key=lambda s: s.left)
+    name_shapes.sort(key=lambda s: s.left)
+    tag_shapes.sort(key=lambda s: s.left)
+
+    for i, seg in enumerate(segments[:5]):
+        if i < len(pct_shapes):
+            _set_text_preserve_format(pct_shapes[i].text_frame, f"{seg.get('size_pct', '?')}%")
+        if i < len(name_shapes):
+            _set_text_preserve_format(name_shapes[i].text_frame, seg.get("name", f"Segment {i+1}"))
+        if i < len(tag_shapes):
+            _set_text_preserve_format(tag_shapes[i].text_frame, _truncate(seg.get("tagline", ""), 70))
+
+    # Clear excess shapes if fewer than 5 segments
+    for shapes_list in [pct_shapes, name_shapes, tag_shapes]:
+        for i in range(len(segments), len(shapes_list)):
+            _set_text_preserve_format(shapes_list[i].text_frame, "")
+
+    return slide
+
+
+def _build_why_not_segments(prs, deprioritized, brand_name):
+    """Build 'WHY NOT PRIORITIZE OTHER SEGMENTS (FOR NOW)' slide.
+
+    Uses T_CONTENT template with structured deprioritization rationale.
+    """
+    slide = _clone_slide(prs, T_CONTENT)
+    shapes = _find_text_shapes(slide)
+
+    if len(shapes) >= 1:
+        _set_text_preserve_format(shapes[0].text_frame, "WHY NOT PRIORITIZE OTHER SEGMENTS (FOR NOW)")
+
+    bullets = []
+    for dep in deprioritized[:3]:
+        name = dep.get("name", "Segment")
+        reason = dep.get("reason", "Not the right fit for now")
+        bullets.append(f"{name} ({dep.get('size_pct', '?')}%): {_truncate(reason, 65)}")
+
+    if len(shapes) >= 2:
+        _set_text_preserve_format(shapes[1].text_frame, bullets or ["All segments show potential"])
+    if len(shapes) >= 3:
+        closing = f"Building long-term authority requires focus. {brand_name} must anchor the brand before expanding."
+        _set_text_preserve_format(shapes[2].text_frame, _truncate(closing, 85))
+
+    return slide
+
+
+def _build_competitive_fares(prs, fares_data, brand_name):
+    """Build 'HOW [BRAND] FARES AGAINST THE COMPETITION' slide.
+
+    Shows competitive positioning: what each brand wins on, the compromise forced,
+    and the strategic question.
+    """
+    slide = _clone_slide(prs, T_CONTENT)
+    shapes = _find_text_shapes(slide)
+
+    if len(shapes) >= 1:
+        _set_text_preserve_format(shapes[0].text_frame,
+            _truncate(f"HOW {brand_name.upper()} FARES AGAINST THE COMPETITION", 55))
+
+    brand_strengths = fares_data.get("brand_strengths", "")
+    compromise = fares_data.get("category_compromise", "")
+    opportunity = fares_data.get("strategic_opportunity", "")
+
+    bullets = []
+    if brand_strengths:
+        bullets.append(_truncate(brand_strengths, 85))
+    if compromise:
+        bullets.append(_truncate(compromise, 85))
+    if opportunity:
+        bullets.append(_truncate(opportunity, 85))
+
+    if len(shapes) >= 2:
+        _set_text_preserve_format(shapes[1].text_frame, bullets or ["Competitive analysis in progress"])
+    if len(shapes) >= 3:
+        question = fares_data.get("strategic_question",
+            f"What would it look like to build a brand that doesn't force that compromise?")
+        _set_text_preserve_format(shapes[2].text_frame, _truncate(question, 85))
 
     return slide
 
@@ -765,6 +1543,200 @@ def _build_final_summary(prs, summary_data):
     return slide
 
 
+# ── Chart Slide Builders (Questionnaire Section) ──────────────
+
+def _remove_chart_shapes(slide, clean_region=True):
+    """Remove chart shapes and optionally all chart-region elements.
+
+    After cloning, chart objects decompose into extra shapes (axis titles,
+    connectors, sub-labels). With clean_region=True, we also remove these
+    orphaned elements, keeping only the slide title (top < 600000) and
+    base/sample text (top > 6000000).
+    """
+    for shape in list(slide.shapes):
+        if shape.shape_type == 3:  # CHART
+            shape._element.getparent().remove(shape._element)
+        elif shape.shape_type == 9:  # LINE / CONNECTOR
+            shape._element.getparent().remove(shape._element)
+
+    if not clean_region:
+        return
+
+    for shape in list(slide.shapes):
+        if shape.top < 600000 or shape.top > 6000000:
+            continue
+        shape._element.getparent().remove(shape._element)
+
+
+def _insert_chart_image(slide, chart_path: Path, left=None, top=None, width=None, height=None):
+    """Insert a chart PNG image onto a slide at specified position.
+
+    If position not given, uses default chart area (centered, below title).
+    """
+    if not chart_path or not chart_path.exists():
+        return
+    if left is None:
+        left = Emu(348906)
+    if top is None:
+        top = Emu(1879166)
+    if width is None:
+        width = Emu(11843094)
+    if height is None:
+        height = Emu(4114800)
+    slide.shapes.add_picture(str(chart_path), left, top, width, height)
+
+
+def _insert_asset_image(slide, asset_name: str, left, top, width, height):
+    """Insert an asset image (gender_icon, etc.) at a specific position."""
+    asset_path = ASSETS_DIR / asset_name
+    if not asset_path.exists():
+        return
+    slide.shapes.add_picture(str(asset_path), left, top, width, height)
+
+
+def _build_chart_divider(prs, template_idx, title_override=None):
+    """Clone a section divider slide (Demographics, Shopping, Brand Eval)."""
+    slide = _clone_slide(prs, template_idx)
+    if title_override:
+        shapes = _find_text_shapes(slide)
+        if shapes:
+            _set_text_preserve_format(shapes[0].text_frame, title_override)
+    return slide
+
+
+def _build_chart_slide(prs, chart_data: dict, chart_path: Path, template_idx=None):
+    """Build a chart slide by cloning a template and replacing charts with rendered images.
+
+    Args:
+        chart_data: Chart metadata from analyzer (title, subtitle, chart_type, etc.)
+        chart_path: Path to the rendered chart PNG
+        template_idx: Which template slide to clone (auto-selected by chart_type if None)
+    """
+    chart_type = chart_data.get("chart_type", chart_data.get("type", "hbar"))
+
+    if template_idx is None:
+        template_idx = {
+            "dual": T_CHART_DUAL,
+            "donut": T_CHART_DUAL,
+            "pie": T_CHART_SINGLE_HBAR,
+            "hbar": T_CHART_SINGLE_HBAR,
+            "vbar": T_CHART_SINGLE_VBAR,
+            "stacked": T_CHART_STACKED,
+            "funnel": T_CHART_SINGLE_HBAR,
+            "grouped_bar": T_CHART_SINGLE_HBAR,
+            "wordcloud": T_CHART_SINGLE_HBAR,
+            "matrix": T_CHART_TABLE,
+            "table": T_CHART_TABLE,
+        }.get(chart_type, T_CHART_SINGLE_HBAR)
+
+    slide = _clone_slide(prs, template_idx)
+
+    _remove_chart_shapes(slide)
+
+    # Update title (kept by _remove_chart_shapes — top < 600000)
+    title = chart_data.get("title", "")
+    for s in _find_text_shapes(slide):
+        text = s.text_frame.text.strip()
+        if text and text.isupper() and len(text) < 80:
+            _set_text_preserve_format(s.text_frame, _truncate(title, 60))
+            break
+
+    # Add subtitle/question as a new text box (old ones were removed with chart region)
+    subtitle = chart_data.get("subtitle", "") or chart_data.get("question", "")
+    if subtitle:
+        from pptx.util import Pt
+        txBox = slide.shapes.add_textbox(
+            Emu(419100), Emu(1124334), Emu(11353800), Emu(500000)
+        )
+        tf = txBox.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        run = p.add_run()
+        run.text = _truncate(subtitle, 120)
+        run.font.size = Pt(18)
+        run.font.color.rgb = RGBColor(0x29, 0x25, 0x24)
+        run.font.italic = True
+
+    # Insert rendered chart image below subtitle — size by chart type
+    if chart_type == "dual":
+        _insert_chart_image(slide, chart_path,
+                            left=Emu(419100), top=Emu(1750000),
+                            width=Emu(11353800), height=Emu(4300000))
+    elif chart_type in ("donut", "pie"):
+        # Full-width layout (donut left + bars right) to fill the slide
+        _insert_chart_image(slide, chart_path,
+                            left=Emu(419100), top=Emu(1750000),
+                            width=Emu(11353800), height=Emu(4300000))
+    elif chart_type == "vbar":
+        # Vertical bar: slightly narrower to avoid edge clipping
+        _insert_chart_image(slide, chart_path,
+                            left=Emu(600000), top=Emu(1750000),
+                            width=Emu(10992000), height=Emu(4300000))
+    elif chart_type == "matrix":
+        # Matrix/table: full width, slightly taller for readability
+        _insert_chart_image(slide, chart_path,
+                            left=Emu(419100), top=Emu(1650000),
+                            width=Emu(11353800), height=Emu(4600000))
+    elif chart_type == "wordcloud":
+        # Word cloud: centered, large square area
+        chart_w = Emu(8229600)   # 9.0 inches
+        chart_h = Emu(4389120)   # 4.8 inches
+        chart_left = Emu((12192000 - 8229600) // 2)
+        _insert_chart_image(slide, chart_path,
+                            left=chart_left, top=Emu(1750000),
+                            width=chart_w, height=chart_h)
+    elif chart_type == "grouped_bar":
+        # Grouped bar: full width with small margins
+        _insert_chart_image(slide, chart_path,
+                            left=Emu(419100), top=Emu(1750000),
+                            width=Emu(11353800), height=Emu(4300000))
+    else:
+        # Default hbar: full width
+        _insert_chart_image(slide, chart_path)
+
+    return slide
+
+
+def _build_respondent_profile(prs, chart_paths: list[Path], demographics: dict = None):
+    """Build respondent profile slide with gender icon + generation/ethnicity charts.
+
+    Clones template slide 28 and replaces charts with rendered images.
+    Inserts gender_icon.png asset.
+    """
+    slide = _clone_slide(prs, 28)
+    _remove_chart_shapes(slide, clean_region=True)
+
+    # Remove group shapes (original gender icon groups)
+    for shape in list(slide.shapes):
+        if shape.shape_type == 6:  # GROUP
+            sp = shape._element
+            sp.getparent().remove(sp)
+
+    # Insert gender icon
+    _insert_asset_image(slide, "gender_icon.png",
+                        left=Emu(400000), top=Emu(1400000),
+                        width=Emu(2200000), height=Emu(2200000))
+
+    # Insert chart images (generation bar chart on right top, ethnicity on right bottom)
+    if len(chart_paths) >= 1:
+        _insert_chart_image(slide, chart_paths[0],
+                            left=Emu(3364800), top=Emu(1500000),
+                            width=Emu(8229600), height=Emu(2100000))
+    if len(chart_paths) >= 2:
+        _insert_chart_image(slide, chart_paths[1],
+                            left=Emu(3364800), top=Emu(3800000),
+                            width=Emu(8229600), height=Emu(2100000))
+
+    shapes = _find_text_shapes(slide)
+    for s in shapes:
+        text = s.text_frame.text.strip()
+        if "RESPONDENT" in text.upper():
+            _set_text_preserve_format(s.text_frame, "RESPONDENT PROFILE")
+            break
+
+    return slide
+
+
 # ── Main Generator ───────────────────────────────────────────
 
 async def generate_pptx(
@@ -808,7 +1780,9 @@ async def generate_pptx(
     slide_meta.append({"type": "cover", "content": {"brand_name": brand_name}})
 
     # ── 2. Agenda ─────────────────────────────────────────────
-    _build_agenda(prs)
+    slide = _build_agenda(prs)
+    if img_pool.has_images():
+        _replace_slide_image(slide, img_pool.next_brand())
     slide_meta.append({"type": "agenda", "content": {}})
 
     # ── 3. Approach ───────────────────────────────────────────
@@ -849,13 +1823,15 @@ async def generate_pptx(
                 _replace_slide_image(slide, img_pool.next_brand())
             slide_meta.append({"type": "insight", "content": section})
 
-    # Brand challenges
-    for challenge in cap.get("brand_challenges", []):
+    # Brand challenges (alternate templates for variety)
+    for ci, challenge in enumerate(cap.get("brand_challenges", [])):
+        tmpl = template_pool[(ci + 1) % len(template_pool)]
         slide = _build_content_slide(
             prs,
             title=challenge.get("title", "BRAND CHALLENGE"),
             bullets=challenge.get("bullets", []),
             insight_text=challenge.get("insight", ""),
+            template_idx=tmpl,
         )
         if img_pool.has_images():
             _replace_slide_image(slide, img_pool.next_brand())
@@ -913,11 +1889,18 @@ async def generate_pptx(
         # Landscape summary
         landscape = comp.get("landscape_summary", {})
         if landscape:
+            roles = landscape.get("market_roles", [])
+            role_bullets = [
+                f"{r['role']}: {', '.join(r.get('brands', []))} — {r.get('description', '')}"
+                for r in roles[:4]
+            ]
+            white_space = landscape.get("white_space", "")
+            sidebar = f"White Space Opportunity:\n{white_space}" if white_space else ""
             slide = _build_landscape_slide(
                 prs,
-                title=landscape.get("title", "A WELL-ESTABLISHED LANDSCAPE"),
-                bullets=landscape.get("bullets", []),
-                sidebar_text=landscape.get("sidebar", ""),
+                title="COMPETITIVE LANDSCAPE ROLES",
+                bullets=role_bullets or ["No market roles identified"],
+                sidebar_text=sidebar,
             )
             slide_meta.append({"type": "landscape", "content": landscape})
 
@@ -955,22 +1938,97 @@ async def generate_pptx(
                 _replace_slide_image(slide, img_pool.next_lifestyle())
             slide_meta.append({"type": "insight", "content": insight})
 
-        # Segmentation divider
+        # ── Questionnaire / Chart Slides ─────────────────────
+        charts = consumer.get("charts", [])
+        if charts:
+            from pipeline.chart_renderer import render_chart
+            chart_output_dir = OUTPUT_DIR / f"project_{project_id}" / "charts"
+
+            # Demographics divider
+            _build_chart_divider(prs, T_CHART_DIVIDER_DEMO, "Demographics &\nBackground")
+            slide_meta.append({"type": "divider", "content": {"title": "Demographics & Background"}})
+
+            shopping_inserted = False
+            drivers_inserted = False
+            brand_inserted = False
+            metrics_def_inserted = False
+            for ci, chart_data in enumerate(charts):
+                chart_path = render_chart(chart_data, chart_output_dir, ci)
+                chart_type = chart_data.get("chart_type", chart_data.get("type", "hbar"))
+                title_lower = chart_data.get("title", "").lower()
+                section_lower = chart_data.get("section", "").lower()
+
+                is_shopping = section_lower in ("shopping habits", "shopping") or any(kw in title_lower for kw in ("shopping", "habit", "frequency", "spend", "channel", "purchase channel", "occasion", "pre-purchase", "usage"))
+                is_driver = section_lower in ("purchase drivers", "drivers") or any(kw in title_lower for kw in ("driver", "matters most", "premium", "willingness", "pay", "wordcloud", "say about", "pain point"))
+                is_brand = section_lower in ("brand evaluation", "brand") or any(kw in title_lower for kw in ("brand", "awareness", "metric", "association", "matrix", "perception", "favorite", "likelihood", "switching"))
+
+                if not shopping_inserted and ci >= 1 and (is_shopping or ci == 4):
+                    _build_chart_divider(prs, T_CHART_DIVIDER_SHOPPING, "Shopping Habits, Usage,\nAttitude and Image")
+                    slide_meta.append({"type": "divider", "content": {"title": "Shopping Habits"}})
+                    shopping_inserted = True
+                elif not drivers_inserted and shopping_inserted and (is_driver or ci >= 8):
+                    _build_chart_divider(prs, T_CHART_DIVIDER_SHOPPING, "Purchase Drivers\n& Barriers")
+                    slide_meta.append({"type": "divider", "content": {"title": "Purchase Drivers"}})
+                    drivers_inserted = True
+                elif not brand_inserted and (shopping_inserted or drivers_inserted) and (is_brand or ci >= len(charts) - 3):
+                    _build_chart_divider(prs, T_CHART_DIVIDER_BRAND, "Brand Evaluation &\nCompetitor Analysis")
+                    slide_meta.append({"type": "divider", "content": {"title": "Brand Evaluation"}})
+                    brand_inserted = True
+
+                if chart_path is None:
+                    continue
+
+                if not metrics_def_inserted and chart_type in ("funnel", "grouped_bar") and is_brand:
+                    _build_brand_metrics_def(prs)
+                    slide_meta.append({"type": "boilerplate", "content": {"title": "Brand Metrics Definitions"}})
+                    metrics_def_inserted = True
+
+                _build_chart_slide(prs, chart_data, chart_path)
+                slide_meta.append({"type": "chart", "content": chart_data})
+
+        # Segmentation divider + intro boilerplate
         segments = consumer.get("segments", [])
         if segments:
             _clone_slide(prs, T_SEGMENT_DIVIDER)
             slide_meta.append({"type": "divider", "content": {"title": "Market Segmentation"}})
 
+            _build_segmentation_intro(prs)
+            slide_meta.append({"type": "boilerplate", "content": {"title": "Benefits of Segmentation"}})
+
             # Segment overview (all segments at a glance)
             _build_segment_overview(prs, segments)
             slide_meta.append({"type": "segment_overview", "content": {"segments": [s.get("name") for s in segments]}})
 
-            # Individual "Meet the [Segment]" slides
+            # "FOCUSING ON THE MOST DOMINANT SEGMENTS…"
+            _build_focusing_segments(prs, segments)
+            slide_meta.append({"type": "focusing", "content": {"segments": [s.get("name") for s in segments]}})
+
+            # Individual segment slides: 6-slide pattern per segment
+            # 1. Meet Segment  2. Respondent Profile  3. Closer Look 1
+            # 4. Closer Look 2  5. Challenges Table  6. Closer Look 3
             for seg in segments[:5]:
                 slide = _build_meet_segment(prs, seg)
                 if img_pool.has_images():
-                    _replace_slide_image(slide, img_pool.next_lifestyle())
+                    _replace_slide_image(slide, img_pool.next_lifestyle(), replace_background=True)
                 slide_meta.append({"type": "meet_segment", "content": seg})
+
+                _build_segment_profile(prs, seg)
+                slide_meta.append({"type": "segment_profile", "content": {"segment": seg.get("name")}})
+
+                _build_segment_closer_look(prs, seg, slide_num=1)
+                slide_meta.append({"type": "closer_look", "content": {"segment": seg.get("name"), "slide": 1}})
+
+                _build_segment_closer_look(prs, seg, slide_num=2)
+                slide_meta.append({"type": "closer_look", "content": {"segment": seg.get("name"), "slide": 2}})
+
+                _build_segment_challenges(prs, seg)
+                slide_meta.append({"type": "challenges", "content": {"segment": seg.get("name")}})
+
+                slide = _build_segment_closer_look(prs, seg, slide_num=3)
+                # Replace all 4 lifestyle card images on closer_look_3
+                if img_pool.has_images():
+                    _replace_card_images(slide, img_pool)
+                slide_meta.append({"type": "closer_look", "content": {"segment": seg.get("name"), "slide": 3}})
 
         # Target recommendation
         target = consumer.get("target_recommendation", {})
@@ -985,6 +2043,25 @@ async def generate_pptx(
 
             _build_enables_slide(prs, target)
             slide_meta.append({"type": "enables", "content": target})
+
+            # "WHY NOT PRIORITIZE OTHER SEGMENTS"
+            deprioritized = consumer.get("deprioritized_segments", [])
+            if not deprioritized and len(segments) > 1:
+                primary = target.get("primary_segment", "")
+                deprioritized = [
+                    {"name": s.get("name", ""), "size_pct": s.get("size_pct", "?"),
+                     "reason": f"Not the primary focus — different needs and priorities"}
+                    for s in segments if s.get("name") != primary
+                ][:3]
+            if deprioritized:
+                _build_why_not_segments(prs, deprioritized, brand_name)
+                slide_meta.append({"type": "why_not", "content": {"segments": deprioritized}})
+
+            # "HOW [BRAND] FARES AGAINST THE COMPETITION"
+            fares = consumer.get("competitive_fares", {})
+            if fares:
+                _build_competitive_fares(prs, fares, brand_name)
+                slide_meta.append({"type": "fares", "content": fares})
 
         # Consumer summary
         cons_summary = consumer.get("consumer_summary", "")
@@ -1008,9 +2085,16 @@ async def generate_pptx(
 
     # ── Save ──────────────────────────────────────────────────
 
+    # Fix CJK fonts across all slides before saving
+    _fix_cjk_fonts(prs)
+
     output_path = OUTPUT_DIR / f"project_{project_id}" / f"{brand_name}_Brand_Discovery.pptx"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     prs.save(str(output_path))
+
+    # Re-save to fix XML structure issues from slide cloning (LibreOffice compat)
+    prs2 = Presentation(str(output_path))
+    prs2.save(str(output_path))
 
     # Generate previews
     preview_paths = _generate_previews(output_path, project_id)

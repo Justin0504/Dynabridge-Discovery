@@ -120,6 +120,13 @@ export default function Home() {
   const [commentText, setCommentText] = useState("");
   const [authorName, setAuthorName] = useState("");
 
+  // Toast notifications
+  const [toast, setToast] = useState<{ message: string; type: "error" | "success" } | null>(null);
+  const showToast = (message: string, type: "error" | "success" = "error") => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 5000);
+  };
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Load projects on mount
@@ -133,7 +140,7 @@ export default function Home() {
       const data = await listProjects();
       setProjects(data);
     } catch {
-      console.error("Failed to load projects");
+      showToast("Failed to load projects");
     } finally {
       setLoadingProjects(false);
     }
@@ -190,9 +197,14 @@ export default function Home() {
   };
 
   const handleDeleteProject = async (pid: number) => {
-    await deleteProject(pid);
-    if (activeProjectId === pid) handleNewProject();
-    loadProjects();
+    try {
+      await deleteProject(pid);
+      if (activeProjectId === pid) handleNewProject();
+      loadProjects();
+      showToast("Project deleted", "success");
+    } catch {
+      showToast("Failed to delete project");
+    }
   };
 
   const handleAddCompetitor = () => {
@@ -281,6 +293,7 @@ export default function Home() {
         async () => {
           setIsGenerating(false);
           setCurrentStep(null);
+          showToast("Report generated successfully!", "success");
           // Load slide previews
           const slideData = await getSlides(pid!);
           setSlides(slideData);
@@ -293,14 +306,14 @@ export default function Home() {
         },
         (msg: string) => {
           setIsGenerating(false);
-          console.error("Generation error:", msg);
+          showToast(msg || "Generation failed");
           loadProjects();
         },
         phase
       );
     } catch (err) {
       setIsGenerating(false);
-      console.error(err);
+      showToast("Failed to start generation");
     }
   };
 
@@ -872,6 +885,20 @@ export default function Home() {
           )}
         </main>
       </div>
+
+      {/* Toast notification */}
+      {toast && (
+        <div className={`fixed bottom-6 right-6 z-50 px-5 py-3 rounded-xl shadow-lg text-sm font-medium transition-all ${
+          toast.type === "error"
+            ? "bg-red-600 text-white"
+            : "bg-green-600 text-white"
+        }`}>
+          {toast.message}
+          <button onClick={() => setToast(null)} className="ml-3 opacity-70 hover:opacity-100">
+            <X className="w-3.5 h-3.5 inline" />
+          </button>
+        </div>
+      )}
     </div>
   );
 }

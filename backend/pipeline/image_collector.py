@@ -10,6 +10,7 @@ categorized dict for the PPT generator to use.
 """
 import asyncio
 import hashlib
+import json
 import re
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -42,19 +43,33 @@ async def collect_images(
     tasks = [
         _collect_from_website(img_dir, brand_url, scrape_data),
         _collect_from_ecommerce(img_dir, ecommerce_data),
-        _collect_from_unsplash(img_dir, brand_name, category_keywords),
+        _collect_from_website_httpx(img_dir, brand_url, brand_name),
+        _collect_via_web_search(img_dir, brand_name, category_keywords),
     ]
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     brand_imgs = results[0] if not isinstance(results[0], Exception) else []
     product_imgs = results[1] if not isinstance(results[1], Exception) else []
-    lifestyle_imgs = results[2] if not isinstance(results[2], Exception) else []
+    httpx_imgs = results[2] if not isinstance(results[2], Exception) else []
+    search_imgs = results[3] if not isinstance(results[3], Exception) else []
+
+    # Merge httpx brand images with Playwright brand images (deduplicate by path)
+    seen = {p.name for p in brand_imgs}
+    for p in httpx_imgs:
+        if p.name not in seen:
+            brand_imgs.append(p)
+            seen.add(p.name)
+
+    lifestyle_imgs = search_imgs
 
     # Sort each list: landscape-first (wider images get priority)
     brand_imgs = _sort_by_aspect(brand_imgs)
     product_imgs = _sort_by_aspect(product_imgs)
     lifestyle_imgs = _sort_by_aspect(lifestyle_imgs)
+
+    total = len(brand_imgs) + len(product_imgs) + len(lifestyle_imgs)
+    print(f"[image_collector] Collected {total} images: brand={len(brand_imgs)}, product={len(product_imgs)}, lifestyle={len(lifestyle_imgs)}")
 
     return {
         "brand": brand_imgs,
@@ -65,15 +80,17 @@ async def collect_images(
 
 
 def _sort_by_aspect(paths: list[Path]) -> list[Path]:
-    """Sort images by aspect ratio, landscape-first."""
-    def _ratio(p):
+    """Sort images by area (largest first), then landscape-preference."""
+    def _score(p):
         try:
             from PIL import Image
             with Image.open(str(p)) as img:
-                return img.width / img.height
+                area = img.width * img.height
+                landscape_bonus = 1.2 if img.width > img.height else 1.0
+                return area * landscape_bonus
         except Exception:
-            return 1.0
-    return sorted(paths, key=_ratio, reverse=True)
+            return 0
+    return sorted(paths, key=_score, reverse=True)
 
 
 def _img_filename(url: str, prefix: str) -> str:
@@ -85,42 +102,60 @@ def _img_filename(url: str, prefix: str) -> str:
     return f"{prefix}_{h}{ext}"
 
 
+MIN_WIDTH = 500
+MIN_HEIGHT = 300
+MAX_ASPECT = 4.0   # reject very wide banners
+MIN_ASPECT_DEFAULT = 0.3  # reject very tall/narrow
+
+
 async def _download_image(
     client: httpx.AsyncClient, url: str, save_path: Path, min_aspect: float = 0.0
 ) -> Path | None:
-    """Download an image if it doesn't already exist.
+    """Download an image if it meets quality criteria.
 
-    Args:
-        min_aspect: Minimum width/height ratio. Set >1.0 to require landscape.
-                    0.6 filters out very tall/narrow images.
+    Rejects images that are too small (< 500x300), have extreme aspect
+    ratios, or are below the byte-size threshold.
     """
-    if save_path.exists() and save_path.stat().st_size > 1000:
-        # Check aspect ratio of existing file
-        if min_aspect > 0:
-            try:
-                from PIL import Image
-                with Image.open(str(save_path)) as img:
-                    if img.width / img.height < min_aspect:
-                        return None
-            except Exception:
-                pass
+    if save_path.exists() and save_path.stat().st_size > 5000:
+        try:
+            from PIL import Image
+            with Image.open(str(save_path)) as img:
+                ratio = img.width / img.height
+                if img.width < MIN_WIDTH or img.height < MIN_HEIGHT:
+                    return None
+                if ratio < (min_aspect or MIN_ASPECT_DEFAULT) or ratio > MAX_ASPECT:
+                    return None
+            return save_path
+        except Exception:
+            pass
         return save_path
     try:
         resp = await client.get(url, follow_redirects=True, timeout=10)
-        if resp.status_code == 200 and len(resp.content) > 5000:
+        if resp.status_code == 200 and len(resp.content) > 8000:
             content_type = resp.headers.get("content-type", "")
             if "image" in content_type or save_path.suffix in (".jpg", ".jpeg", ".png", ".webp"):
-                # Check aspect ratio before saving
-                if min_aspect > 0:
+                from PIL import Image
+                import io
+                try:
+                    with Image.open(io.BytesIO(resp.content)) as img:
+                        ratio = img.width / img.height
+                        if img.width < MIN_WIDTH or img.height < MIN_HEIGHT:
+                            return None
+                        if ratio < (min_aspect or MIN_ASPECT_DEFAULT) or ratio > MAX_ASPECT:
+                            return None
+                except Exception:
+                    return None
+
+                # Convert WEBP to PNG (python-pptx doesn't support WEBP)
+                if save_path.suffix.lower() == ".webp" or "webp" in content_type:
                     try:
-                        from PIL import Image
-                        import io
                         with Image.open(io.BytesIO(resp.content)) as img:
-                            if img.width / img.height < min_aspect:
-                                return None
+                            save_path = save_path.with_suffix(".png")
+                            img.convert("RGB").save(str(save_path), format="PNG")
                     except Exception:
-                        pass
-                save_path.write_bytes(resp.content)
+                        save_path.write_bytes(resp.content)
+                else:
+                    save_path.write_bytes(resp.content)
                 return save_path
     except Exception:
         pass
@@ -248,56 +283,268 @@ async def _collect_from_ecommerce(
     return images
 
 
-# ── Source 3: Unsplash Stock Photos ──────────────────────────
+# ── Source 3: httpx-based website image extraction ─────────
 
-UNSPLASH_API = "https://api.unsplash.com/search/photos"
-
-async def _collect_from_unsplash(
-    img_dir: Path,
-    brand_name: str,
-    category_keywords: list[str] = None,
+async def _collect_from_website_httpx(
+    img_dir: Path, brand_url: str, brand_name: str,
 ) -> list[Path]:
-    """Fetch relevant stock photos from Unsplash.
+    """Extract images from the brand website using plain httpx + regex.
 
-    Uses the free tier (50 req/hour) — no API key needed for demo.
-    Falls back to direct URL pattern if API fails.
+    Fallback when Playwright is unavailable. Fetches the homepage HTML
+    and extracts img src attributes, og:image meta tags, and other
+    common image patterns.
     """
-    if not category_keywords:
-        category_keywords = _infer_keywords(brand_name)
+    if not brand_url:
+        return []
 
-    queries = category_keywords[:3]  # Max 3 searches
     images = []
+    image_urls = set()
 
-    async with httpx.AsyncClient() as client:
-        for query in queries:
+    pages_to_try = [brand_url]
+    if not brand_url.endswith("/"):
+        pages_to_try.append(brand_url + "/")
+    for suffix in ("/collections", "/products", "/pages/about"):
+        pages_to_try.append(brand_url.rstrip("/") + suffix)
+
+    async with httpx.AsyncClient(
+        follow_redirects=True, timeout=12,
+        headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
+    ) as client:
+        for page_url in pages_to_try[:4]:
             try:
-                # Unsplash source URL (no API key needed, direct redirect)
-                for i in range(2):
-                    url = f"https://source.unsplash.com/1200x800/?{query.replace(' ', ',')}&sig={hash(query + str(i))}"
-                    fname = _img_filename(f"{query}_{i}", "stock")
-                    path = img_dir / fname
-                    if path.exists() and path.stat().st_size > 5000:
-                        images.append(path)
-                        continue
+                resp = await client.get(page_url)
+                if resp.status_code != 200:
+                    continue
+                html = resp.text
 
-                    try:
-                        resp = await client.get(url, follow_redirects=True, timeout=10)
-                        if resp.status_code == 200 and len(resp.content) > 5000:
-                            path.write_bytes(resp.content)
-                            images.append(path)
-                    except Exception:
+                # og:image
+                for m in re.finditer(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', html):
+                    image_urls.add(urljoin(page_url, m.group(1)))
+
+                # img src (skip tiny icons and data URIs)
+                for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)', html):
+                    src = m.group(1)
+                    if src.startswith("data:") or ".svg" in src:
                         continue
+                    if any(skip in src for skip in ("pixel", "track", "analytics", "icon", "logo", "favicon")):
+                        continue
+                    image_urls.add(urljoin(page_url, src))
+
+                # srcset (pick largest)
+                for m in re.finditer(r'srcset=["\']([^"\']+)', html):
+                    parts = m.group(1).split(",")
+                    best_url = ""
+                    best_w = 0
+                    for part in parts:
+                        tokens = part.strip().split()
+                        if len(tokens) >= 2:
+                            w_match = re.match(r'(\d+)w', tokens[-1])
+                            if w_match and int(w_match.group(1)) > best_w:
+                                best_w = int(w_match.group(1))
+                                best_url = tokens[0]
+                    if best_url and best_w >= 400:
+                        image_urls.add(urljoin(page_url, best_url))
+
             except Exception:
                 continue
 
+        # Download (limit to 15 candidates, keep 10 max)
+        for url in list(image_urls)[:15]:
+            fname = _img_filename(url, "httpx")
+            path = await _download_image(client, url, img_dir / fname, min_aspect=0.5)
+            if path:
+                images.append(path)
+            if len(images) >= 10:
+                break
+
+    print(f"[image_collector] httpx website: found {len(image_urls)} URLs, downloaded {len(images)}")
     return images
 
 
-def _infer_keywords(brand_name: str) -> list[str]:
-    """Infer useful stock photo search keywords from brand name."""
-    # Generic fallbacks — will be overridden by category_keywords if available
-    return [
-        "business professional",
-        "modern office teamwork",
-        "product lifestyle",
-    ]
+# ── Source 4: Web search → scrape discovered pages ────────
+
+async def _collect_via_web_search(
+    img_dir: Path, brand_name: str, category_keywords: list[str] = None,
+) -> list[Path]:
+    """Use Anthropic web_search to find product/lifestyle pages, then scrape images.
+
+    Two-step process:
+      1. Ask Claude to search for the brand and return PAGE URLs
+         (Amazon listings, brand product pages, blog features)
+      2. Fetch those pages via httpx and extract <img> src attributes
+    """
+    try:
+        from config import ANTHROPIC_API_KEY
+        if not ANTHROPIC_API_KEY:
+            return []
+    except ImportError:
+        return []
+
+    try:
+        from anthropic import Anthropic
+        client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+        category_hint = " ".join((category_keywords or [])[:2])
+        prompt = f"""Search the web for "{brand_name}" products and find the best pages that contain product images.
+{f'Category context: {category_hint}' if category_hint else ''}
+
+I need PAGE URLs (not direct image URLs) where I can find high-quality product photos:
+1. {brand_name} Amazon product listing pages
+2. {brand_name} official product/collection pages
+3. Blog or review sites featuring {brand_name} products
+
+Return a JSON array of page URLs: ["https://...", "https://..."]
+Return 5-8 URLs. Return ONLY the JSON array."""
+
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        text = ""
+        for block in response.content:
+            if hasattr(block, "text"):
+                text += block.text
+
+        page_urls = []
+        start = text.find("[")
+        end = text.rfind("]") + 1
+        if start >= 0 and end > start:
+            try:
+                items = json.loads(text[start:end])
+                for item in items:
+                    url = item if isinstance(item, str) else (item.get("url", "") if isinstance(item, dict) else "")
+                    if url.startswith("http"):
+                        page_urls.append(url)
+            except Exception:
+                pass
+
+        # Also extract raw URLs from the text
+        for m in re.finditer(r'https?://[^\s"\'<>\]]+', text):
+            url = m.group(0).rstrip(".,;)")
+            if url.startswith("http") and url not in page_urls:
+                page_urls.append(url)
+
+        print(f"[image_collector] web_search: found {len(page_urls)} page URLs to scrape")
+
+        # Step 2: scrape images from discovered pages
+        images = []
+        image_urls = set()
+        async with httpx.AsyncClient(
+            follow_redirects=True, timeout=12,
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
+        ) as dl_client:
+            for page_url in page_urls[:6]:
+                try:
+                    resp = await dl_client.get(page_url)
+                    if resp.status_code != 200:
+                        continue
+                    html = resp.text
+
+                    # og:image
+                    for m in re.finditer(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', html):
+                        image_urls.add(urljoin(page_url, m.group(1)))
+
+                    # img src — prefer large/product images
+                    for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)', html):
+                        src = m.group(1)
+                        if src.startswith("data:") or ".svg" in src:
+                            continue
+                        if any(skip in src.lower() for skip in ("pixel", "track", "icon", "logo", "favicon", "sprite")):
+                            continue
+                        image_urls.add(urljoin(page_url, src))
+
+                    # srcset largest
+                    for m in re.finditer(r'srcset=["\']([^"\']+)', html):
+                        parts = m.group(1).split(",")
+                        best_url, best_w = "", 0
+                        for part in parts:
+                            tokens = part.strip().split()
+                            if len(tokens) >= 2:
+                                w_match = re.match(r'(\d+)w', tokens[-1])
+                                if w_match and int(w_match.group(1)) > best_w:
+                                    best_w = int(w_match.group(1))
+                                    best_url = tokens[0]
+                        if best_url and best_w >= 400:
+                            image_urls.add(urljoin(page_url, best_url))
+
+                except Exception:
+                    continue
+
+            # Download discovered images
+            for url in list(image_urls)[:20]:
+                fname = _img_filename(url, "search")
+                path = await _download_image(dl_client, url, img_dir / fname, min_aspect=0.4)
+                if path:
+                    images.append(path)
+                if len(images) >= 10:
+                    break
+
+        print(f"[image_collector] web_search: scraped {len(image_urls)} image URLs, downloaded {len(images)}")
+        return images
+
+    except Exception as e:
+        print(f"[image_collector] web_search failed: {e}")
+        return []
+
+
+def infer_category_keywords(
+    brand_name: str,
+    category: str = "",
+    brand_context: dict = None,
+) -> list[str]:
+    """Generate semantically-aligned image search keywords from brand/category context.
+
+    Called by the pipeline to produce better stock photo matches.
+    """
+    keywords = []
+
+    if brand_context:
+        cat = brand_context.get("category_landscape", {})
+        cat_name = cat.get("category_name", category)
+        if cat_name:
+            keywords.append(cat_name)
+
+        pos = brand_context.get("brand_positioning", {})
+        target = pos.get("target_audience", "")
+        if target:
+            keywords.append(target.split(",")[0].strip()[:50])
+
+    if category:
+        keywords.append(category)
+
+    category_image_map = {
+        "scrubs": ["nurse hospital professional", "healthcare worker scrubs", "medical team modern", "doctor confident portrait", "hospital hallway clinical"],
+        "medical": ["healthcare professional", "medical team hospital", "nurse caring patient"],
+        "baby": ["mother baby nursery", "parent infant care", "baby product lifestyle"],
+        "cleaning": ["clean home modern", "steam cleaning floor", "household cleaning product"],
+        "water filter": ["clean water kitchen", "water purification home", "family drinking water"],
+        "bag": ["eco bag lifestyle", "sustainable fashion bag", "woman carrying bag urban"],
+        "lingerie": ["confident woman fashion", "intimate apparel lifestyle", "woman self care"],
+        "skincare": ["skincare routine woman", "beauty product lifestyle", "woman glowing skin"],
+        "apparel": ["fashion lifestyle model", "casual wear street style", "modern clothing brand"],
+        "yoga": ["yoga practice woman", "fitness lifestyle mindful", "athleisure fashion"],
+        "shoe": ["sneaker lifestyle urban", "athletic shoe running", "shoe fashion street"],
+    }
+
+    cat_lower = (category or "").lower()
+    if brand_context:
+        cat_lower = brand_context.get("category_landscape", {}).get("category_name", cat_lower).lower()
+
+    for key, searches in category_image_map.items():
+        if key in cat_lower:
+            keywords.extend(searches[:3])
+            break
+
+    if not keywords:
+        keywords = [
+            f"{brand_name} product lifestyle",
+            "business professional team",
+            "modern brand lifestyle",
+            "consumer product premium",
+            "professional workspace modern",
+        ]
+
+    return keywords[:5]
